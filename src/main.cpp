@@ -91,6 +91,8 @@ float outsideTemp = NAN;
 unsigned long lastOutsideMs = 0;
 const unsigned long OUTSIDE_INTERVAL_MS = 5000; // sample every 5 seconds
 bool outsideConvRequested = false;  // async DS18B20 flag
+DeviceAddress outsideSensorAddr;    // stored sensor address
+bool ds18b20Found = false;          // sensor discovered?
 
 // oil temperature cache
 float oilTempCached = NAN;
@@ -450,14 +452,18 @@ float readOilTempOnce()
 
 void updateOutsideTemp()
 {
+	if (!ds18b20Found)
+		return;
+
 	unsigned long now = millis();
 
 	// first call: kick off initial conversion
 	if (lastOutsideMs == 0 && !outsideConvRequested)
 	{
-		dsSensors.requestTemperatures();  // non-blocking if setWaitForConversion(false)
+		dsSensors.requestTemperaturesByAddress(outsideSensorAddr);
 		outsideConvRequested = true;
 		lastOutsideMs = now;
+		Serial.println("DS18B20: first conversion requested");
 		return;
 	}
 
@@ -465,12 +471,11 @@ void updateOutsideTemp()
 	{
 		// 800ms is enough for 12-bit DS18B20 conversion
 		outsideConvRequested = false;
-		if (dsSensors.getDeviceCount() > 0)
-		{
-			float t = dsSensors.getTempCByIndex(0);
-			if (t != DEVICE_DISCONNECTED_C)
-				outsideTemp = t;
-		}
+		float t = dsSensors.getTempC(outsideSensorAddr);
+		Serial.print("DS18B20 raw: ");
+		Serial.println(t);
+		if (t != DEVICE_DISCONNECTED_C && t > -50.0f && t < 85.0f)
+			outsideTemp = t;
 		lastOutsideMs = now;
 		return;
 	}
@@ -478,7 +483,7 @@ void updateOutsideTemp()
 	// request new conversion periodically
 	if (!outsideConvRequested && (now - lastOutsideMs >= OUTSIDE_INTERVAL_MS))
 	{
-		dsSensors.requestTemperatures();
+		dsSensors.requestTemperaturesByAddress(outsideSensorAddr);
 		outsideConvRequested = true;
 		lastOutsideMs = now;
 	}
@@ -929,7 +934,7 @@ void drawOilPage(float oilC)
 	else
 	{
 		display.setCursor(SIDE_MARGIN, 2);
-		display.print("NaN");
+		display.print("--");
 	}
 
 	drawCenteredTitleTiny("Oil", 8);
@@ -1262,17 +1267,17 @@ void bootProgressInitAndMaybeCalibrate()
 	int8_t stBno = -1, stBh = -1, stEe = -1;
 
 	// show instantly
-	renderBootProgress(stBno, stBh, stEe, false, 0.05f);
+	renderBootProgress(stBno, stBh, stEe, false, 0.0f);
 
 	// EEPROM
 	eepromOk = loadMaxValues();
 	stEe = eepromOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, false, 0.33f);
+	renderBootProgress(stBno, stBh, stEe, false, 0.2f);
 
 	// BH1750
 	bhOk = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
 	stBh = bhOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, false, 0.66f);
+	renderBootProgress(stBno, stBh, stEe, false, 0.4f);
 
 	// BNO055
 	bnoOk = bno.begin();
@@ -1285,9 +1290,15 @@ void bootProgressInitAndMaybeCalibrate()
 		delay(50);
 	}
 	stBno = bnoOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, false, 1.0f);
+	renderBootProgress(stBno, stBh, stEe, false, 0.6f);
 
-	// wait 2s with hold-to-cal
+	// kick off DS18B20 conversion now — will be ready after 2s wait
+	if (ds18b20Found)
+	{
+		dsSensors.requestTemperaturesByAddress(outsideSensorAddr);
+	}
+
+	// wait 2s with hold-to-cal — bar fills from 0.6 → 1.0 during this time
 	const unsigned long waitMs = 2000;
 	unsigned long t0 = millis();
 
@@ -1297,6 +1308,7 @@ void bootProgressInitAndMaybeCalibrate()
 	while (millis() - t0 < waitMs)
 	{
 		unsigned long now = millis();
+		float prog = 0.6f + 0.4f * clampf((float)(now - t0) / (float)waitMs, 0.0f, 1.0f);
 
 		if (bnoOk && digitalRead(BTN_PIN) == LOW)
 		{
@@ -1310,7 +1322,7 @@ void bootProgressInitAndMaybeCalibrate()
 			holdStart = 0;
 		}
 
-		renderBootProgress(stBno, stBh, stEe, calArmed, 1.0f);
+		renderBootProgress(stBno, stBh, stEe, calArmed, prog);
 		delay(25);
 		yield();
 	}
@@ -1319,17 +1331,57 @@ void bootProgressInitAndMaybeCalibrate()
 	{
 		calibrateRollOffset();
 	}
+
+	// DS18B20 conversion is done after 2s wait — read result now
+	if (ds18b20Found)
+	{
+		float t = dsSensors.getTempC(outsideSensorAddr);
+		if (t != DEVICE_DISCONNECTED_C && t > -50.0f && t < 85.0f)
+			outsideTemp = t;
+		outsideConvRequested = false;
+		lastOutsideMs = millis();
+	}
 }
 
 void showReadyScreen()
 {
-	display.clearDisplay();
-	display.setTextColor(SSD1306_WHITE);
+	const char *txt = "READY";
+
+	// measure text with 18pt font
 	display.setFont(&FreeSansBold18pt7b);
-	display.setCursor(18, 40);
-	display.print("READY");
-	display.display();
-	delay(260);
+	display.setTextSize(1);
+	int16_t x1, y1;
+	uint16_t tw, th;
+	display.getTextBounds(txt, 0, 0, &x1, &y1, &tw, &th);
+	int16_t cx = (SCREEN_WIDTH  - (int16_t)tw) / 2 - x1;
+	int16_t cy = (SCREEN_HEIGHT - (int16_t)th) / 2 - y1;
+
+	// left-to-right reveal: draw full text, mask right portion with black rect shrinking each frame
+	const unsigned long dur = 380;
+	unsigned long t0 = millis();
+
+	while (true)
+	{
+		unsigned long elapsed = millis() - t0;
+		float prog = clampf((float)elapsed / (float)dur, 0.0f, 1.0f);
+		int revealX = (int)(prog * (float)(x1 + (int16_t)tw + cx)); // right edge of revealed area
+
+		display.clearDisplay();
+		display.setTextColor(SSD1306_WHITE);
+		display.setFont(&FreeSansBold18pt7b);
+		display.setCursor(cx, cy);
+		display.print(txt);
+
+		// black mask covers everything to the right of revealX
+		if (revealX < SCREEN_WIDTH)
+			display.fillRect(revealX, 0, SCREEN_WIDTH - revealX, SCREEN_HEIGHT, SSD1306_BLACK);
+
+		display.display();
+
+		if (prog >= 1.0f) break;
+		delay(16);
+	}
+	delay(180); // brief hold after fully revealed
 }
 
 // =========================================================
@@ -1346,13 +1398,29 @@ void setup()
 	Wire.setClock(100000);
 
 	// start one‑wire bus for DS18B20
+	pinMode(ONE_WIRE_PIN, INPUT_PULLUP);  // internal pull-up as substitute for 4.7kΩ resistor
+	delay(10);
 	dsSensors.begin();
 	dsSensors.setWaitForConversion(false);  // non-blocking mode!
 	Serial.print("OneWire device count: ");
 	Serial.println(dsSensors.getDeviceCount());
-	if (dsSensors.getDeviceCount() == 0)
+
+	if (dsSensors.getDeviceCount() > 0 && dsSensors.getAddress(outsideSensorAddr, 0))
 	{
-		Serial.print("Warning: no DS18B20 found on pin ");
+		ds18b20Found = true;
+		dsSensors.setResolution(outsideSensorAddr, 12);
+		Serial.print("DS18B20 found, addr: ");
+		for (int i = 0; i < 8; i++)
+		{
+			if (outsideSensorAddr[i] < 16) Serial.print("0");
+			Serial.print(outsideSensorAddr[i], HEX);
+		}
+		Serial.println();
+	}
+	else
+	{
+		ds18b20Found = false;
+		Serial.print("Warning: no DS18B20 found on GPIO ");
 		Serial.println(ONE_WIRE_PIN);
 	}
 
@@ -1396,6 +1464,18 @@ void setup()
 	rollOffsetDeg = 0.0f; // always start 0 unless calibrated this session
 
 	bootProgressInitAndMaybeCalibrate();
+
+	// pre-fill oil + battery so first frame never shows NaN
+	for (int i = 0; i < 4; i++)
+	{
+		float t = readOilTempOnce();
+		if (!isnan(t)) { oilTempCached = t; break; }
+		delay(20);
+	}
+	battVoltageCached = readBatteryVoltage();
+
+	// outside temp was already read during boot wait — no extra request needed
+
 	showReadyScreen();
 }
 
