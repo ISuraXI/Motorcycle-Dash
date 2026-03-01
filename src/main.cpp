@@ -1,7 +1,7 @@
 /*
   LoLin NodeMCU V3 (ESP8266) Dash
   OLED: 1.51" Transparent OLED (SSD1309) 128x64 via SPI
-  BNO055: Lean angle (IMUPLUS) + G-Force (Linear Accel) via I2C
+  BNO085: Lean angle (GAME_ROTATION_VECTOR, no mag) + G-Force (Linear Accel) via I2C
   BH1750 (GY-302): Night Mode 2.0 (contrast soft fade + optional invert)
   Oil temp: analog A0 (NTC Beta)
   Button: D3 -> GND (INPUT_PULLUP)
@@ -24,8 +24,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_Sensor.h>
-#include <Adafruit_BNO055.h>
-#include <utility/imumaths.h>
+#include <Adafruit_BNO08x.h>
 
 #include <BH1750.h>
 #include <Adafruit_ADS1X15.h> // ADC expander for extra analog inputs
@@ -56,9 +55,13 @@
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, OLED_CS);
 
-// ---------------- BNO055 ----------------
-Adafruit_BNO055 bno(55, 0x28);
+// ---------------- BNO085 ----------------
+Adafruit_BNO08x bno(-1);  // -1 = no reset pin, using I2C
 bool bnoOk = false;
+// cached sensor values updated every loop
+float bno085Roll   = 0.0f;
+float bno085LinX   = 0.0f;
+float bno085LinY   = 0.0f;
 
 // ---------------- BH1750 ----------------
 BH1750 lightMeter;
@@ -82,7 +85,7 @@ const float BATT_R_TOP = 100000.0f; // between battery+ and A2
 const float BATT_R_BOT = 100000.0f; // between A2 and GND
 
 // ---------------- one‑wire / outside temp ----------------
-#define ONE_WIRE_PIN 2 // choose any free GPIO
+#define ONE_WIRE_PIN 25 // GPIO25 - safe pin (GPIO2 is a strapping pin, avoid it)
 OneWire oneWire(ONE_WIRE_PIN);
 DallasTemperature dsSensors(&oneWire);
 
@@ -238,6 +241,7 @@ void updateAdsReadings();
 
 void updateCurvePeakHold(float leanAbs);
 void updateLean();
+static void pollBno085();
 void updateGForce();
 void updateNightMode();
 
@@ -263,6 +267,41 @@ void drawCalIconTopRight(bool bnoOK, bool armed);
 static void drawSelfTestLineProgress(int y, const char *label, int8_t st);
 static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, bool calArmed, float prog01);
 void bootProgressInitAndMaybeCalibrate();
+
+// =========================================================
+// BNO085 helpers
+// =========================================================
+// Convert GAME_ROTATION_VECTOR quaternion → lean angle in degrees
+// Using pitch (Y-axis rotation) for side-to-side lean
+static float bno085QuatToRoll(float qi, float qj, float qk, float qr)
+{
+	float sinp = 2.0f * (qr * qj - qk * qi);
+	sinp = clampf(sinp, -1.0f, 1.0f);
+	return asinf(sinp) * (180.0f / M_PI);
+}
+
+// Poll all pending BNO085 events and cache roll + linear accel
+static void pollBno085()
+{
+	if (!bnoOk) return;
+	sh2_SensorValue_t ev;
+	while (bno.getSensorEvent(&ev))
+	{
+		if (ev.sensorId == SH2_GAME_ROTATION_VECTOR)
+		{
+			bno085Roll = bno085QuatToRoll(
+				ev.un.gameRotationVector.i,
+				ev.un.gameRotationVector.j,
+				ev.un.gameRotationVector.k,
+				ev.un.gameRotationVector.real);
+		}
+		else if (ev.sensorId == SH2_LINEAR_ACCELERATION)
+		{
+			bno085LinX = ev.un.linearAcceleration.x;
+			bno085LinY = ev.un.linearAcceleration.y;
+		}
+	}
+}
 
 // =========================================================
 // HELPERS
@@ -595,8 +634,8 @@ void updateLean()
 	if (!bnoOk)
 		return;
 
-	imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-	float roll = normalizeAngleDeg(euler.y() - rollOffsetDeg);
+	pollBno085();
+	float roll = normalizeAngleDeg(bno085Roll - rollOffsetDeg);
 
 	static bool initDone = false;
 	if (!initDone)
@@ -632,10 +671,8 @@ void updateGForce()
 	if (!bnoOk)
 		return;
 
-	imu::Vector<3> la = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
-
-	float gxNow = la.x() / G0;
-	float gyNow = la.y() / G0;
+	float gxNow = bno085LinX / G0;
+	float gyNow = bno085LinY / G0;
 
 	gX += G_ALPHA * (gxNow - gX);
 	gY += G_ALPHA * (gyNow - gY);
@@ -1137,9 +1174,8 @@ void calibrateRollOffset()
 
 	while (millis() - tStart < durMs)
 	{
-		imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-		float roll = normalizeAngleDeg(euler.y());
-		sum += roll;
+		pollBno085();
+		sum += bno085Roll;
 		n++;
 
 		delay(10);
@@ -1247,7 +1283,7 @@ static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, bool calA
 	display.setCursor(8, 6);
 	display.print("Self-Test");
 
-	drawSelfTestLineProgress(20, "BNO055", stBno);
+	drawSelfTestLineProgress(20, "BNO085", stBno);
 	drawSelfTestLineProgress(30, "BH1750", stBh);
 	drawSelfTestLineProgress(40, "EEPROM", stEe);
 
@@ -1279,16 +1315,16 @@ void bootProgressInitAndMaybeCalibrate()
 	stBh = bhOk ? 1 : 0;
 	renderBootProgress(stBno, stBh, stEe, false, 0.4f);
 
-	// BNO055
-	bnoOk = bno.begin();
+	// BNO085
+	bnoOk = bno.begin_I2C();
 	if (bnoOk)
 	{
-		delay(50);
-		bno.setMode(OPERATION_MODE_IMUPLUS);
-		delay(20);
-		bno.setExtCrystalUse(true);
-		delay(50);
+		// GAME_ROTATION_VECTOR: fused gyro+accel, NO magnetometer → no drift from vibration
+		bno.enableReport(SH2_GAME_ROTATION_VECTOR, 10000);  // 10ms = 100Hz
+		bno.enableReport(SH2_LINEAR_ACCELERATION,  10000);  // 10ms = 100Hz
+		delay(100);
 	}
+	rollOffsetDeg = -3.00f;  // hardcoded mount offset (measured)
 	stBno = bnoOk ? 1 : 0;
 	renderBootProgress(stBno, stBh, stEe, false, 0.6f);
 
@@ -1461,7 +1497,7 @@ void setup()
 
 	oledSetContrast(CONTRAST_DAY);
 
-	rollOffsetDeg = 0.0f; // always start 0 unless calibrated this session
+	rollOffsetDeg = -3.00f;  // hardcoded mount offset
 
 	bootProgressInitAndMaybeCalibrate();
 
