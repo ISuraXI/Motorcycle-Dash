@@ -77,8 +77,9 @@ Adafruit_ADS1115 ads; // default I2C address 0x48
 
 // we will use gain = 1 (±4.096V) which gives 1 LSB = 125µV
 #define ADS_GAIN GAIN_ONE
-#define ADS_VREF 4.096f
+#define ADS_VREF 4.096f       // ADS1115 internal reference for GAIN_ONE (for ADC scaling)
 #define ADS_SCALE (ADS_VREF / 32768.0f)
+#define DIVIDER_VCC 3.3f      // actual supply voltage of the NTC voltage divider
 
 // battery divider resistors (adjust to your hardware)
 const float BATT_R_TOP = 100000.0f; // between battery+ and A2
@@ -481,10 +482,10 @@ float readOilTempOnce()
 		return NAN;
 	if (v <= 0.001f)
 		return NAN;
-	if (v >= (ADS_VREF - 0.001f))
+	if (v >= (DIVIDER_VCC - 0.001f))
 		return NAN;
 
-	float rNtc = R_REF * v / (ADS_VREF - v);
+	float rNtc = R_REF * v / (DIVIDER_VCC - v);
 	float tempK = 1.0f / ((1.0f / (T0C + 273.15f)) + (1.0f / BETA) * logf(rNtc / R0));
 	return tempK - 273.15f;
 }
