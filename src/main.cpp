@@ -1667,8 +1667,9 @@ void loop()
 		raceboxRec = (millis() - raceboxRecLastActiveMs) < RACEBOX_REC_HOLD_MS;
 
 		// detect blitzer pulse (falling edge: HIGH->LOW = buzzer fires)
+		// ignore first 10s after boot to let blitzer warner initialize
 		bool blitzerNow = digitalRead(BLITZER_PIN);
-		if (blitzerPinLast == true && blitzerNow == false)
+		if (millis() > 10000 && blitzerPinLast == true && blitzerNow == false)
 			blitzerActiveUntilMs = millis() + 5000;
 		blitzerPinLast = blitzerNow;
 
