@@ -6,7 +6,7 @@
   Oil temp: analog A0 (NTC Beta)
   Button: D3 -> GND (INPUT_PULLUP)
 
-  Pages (short press cycles): OIL -> LEAN -> G -> OIL ...
+  Pages (short press cycles): OIL -> LEAN -> G -> RACEBOX -> OIL ...
   Long press:
    - LEAN: resets all-time max (EEPROM)
    - G:    resets all-time max (EEPROM)
@@ -136,8 +136,37 @@ enum Page : uint8_t
 {
 	PAGE_OIL = 0,
 	PAGE_LEAN = 1,
-	PAGE_G = 2
+	PAGE_G = 2,
+	PAGE_RACEBOX = 3
 };
+
+// ---------------- RaceBox status inputs ----------------
+#define RACEBOX_GPS_PIN 26  // HIGH when GPS fix active
+#define RACEBOX_BLE_PIN 27  // HIGH when BLE connected
+#define RACEBOX_REC_PIN 33  // HIGH when recording active
+
+bool raceboxGps = false;
+bool raceboxBle = false;
+bool raceboxRec = false;
+unsigned long raceboxRecLastActiveMs = 0; // for blink stabilization
+#define RACEBOX_REC_HOLD_MS 3000
+#define RACEBOX_BTN_PIN 32  // OUTPUT: drives relay to simulate RaceBox button press (active LOW)
+unsigned long raceboxBtnUntilMs = 0;    // when to release the simulated button
+unsigned long raceboxBtnCooldownMs = 0; // prevent re-trigger while holding
+bool raceboxBtnArmed = true;            // only fire once per button press cycle
+#define RACEBOX_LONGPRESS_MS 250        // shorter long press threshold for RaceBox page
+
+// ---------------- Blitzer Warner ----------------
+#define BLITZER_PIN 14
+unsigned long blitzerActiveUntilMs = 0;
+bool blitzerPinLast = true; // for edge detection (HIGH = idle with PULLUP)
+
+// debounce for GPS and BLE (must be stable for 300ms before accepting)
+#define RACEBOX_DEBOUNCE_MS 300
+bool raceboxGpsRaw = false;
+bool raceboxBleRaw = false;
+unsigned long raceboxGpsChangeMs = 0;
+unsigned long raceboxBleChangeMs = 0;
 Page page = PAGE_OIL;
 
 #define BTN_PIN 13
@@ -259,6 +288,7 @@ void drawLeanPage();
 
 void drawGCircle(float gx, float gy, float maxGVal);
 void drawGPage();
+void drawRaceBoxPage();
 
 void calibrateRollOffset();
 void showReadyScreen();
@@ -432,9 +462,10 @@ void buttonUpdate()
 		{
 			if (btn.pressed && !btn.longFired)
 			{
-				page = (Page)((page + 1) % 3);
-				resetAnimUntilMs = 0; // clear reset animation on page switch
+				page = (Page)((page + 1) % 4);
+				resetAnimUntilMs = 0;
 			}
+			raceboxBtnArmed = true; // re-arm after button fully released
 			btn.pressed = false;
 		}
 	}
@@ -442,7 +473,8 @@ void buttonUpdate()
 	// long press (reset)
 	if (btn.pressed && !btn.longFired)
 	{
-		if ((now - btn.pressStartMs) >= LONGPRESS_MS)
+		const unsigned long threshold = (page == PAGE_RACEBOX) ? RACEBOX_LONGPRESS_MS : LONGPRESS_MS;
+		if ((now - btn.pressStartMs) >= threshold)
 		{
 			btn.longFired = true;
 
@@ -457,6 +489,12 @@ void buttonUpdate()
 				maxGSaved = 0.0f;
 				maxDirty = true;
 				resetAnimUntilMs = now + 350;
+			}
+			else if (page == PAGE_RACEBOX && raceboxBtnArmed)
+			{
+				digitalWrite(RACEBOX_BTN_PIN, LOW); // relay active = LOW
+				raceboxBtnUntilMs = now + 1000;
+				raceboxBtnArmed = false;
 			}
 		}
 	}
@@ -1152,9 +1190,75 @@ void drawGPage()
 	display.display();
 }
 
-// =========================================================
-// Calibration
-// =========================================================
+void drawRaceBoxPage()
+{
+	display.clearDisplay();
+	display.setTextColor(SSD1306_WHITE);
+	display.setFont();
+	display.setTextSize(1);
+
+	// Title
+	display.setCursor(34, 0);
+	display.print("RaceBox");
+	display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+	// BLE
+	display.setCursor(8, 18);
+	display.print("BLE");
+	if (raceboxBle) {
+		display.fillRoundRect(50, 16, 32, 12, 3, SSD1306_WHITE);
+		display.setTextColor(SSD1306_BLACK);
+		display.setCursor(54, 18);
+		display.print("CONN");
+		display.setTextColor(SSD1306_WHITE);
+	} else {
+		display.drawRoundRect(50, 16, 32, 12, 3, SSD1306_WHITE);
+		display.setCursor(57, 18);
+		display.print("---");
+	}
+
+	// REC
+	display.setCursor(8, 34);
+	display.print("REC");
+	if (raceboxRec) {
+		display.fillRoundRect(50, 32, 32, 12, 3, SSD1306_WHITE);
+		display.setTextColor(SSD1306_BLACK);
+		display.setCursor(54, 34);
+		display.print(" REC");
+		display.setTextColor(SSD1306_WHITE);
+	} else {
+		display.drawRoundRect(50, 32, 32, 12, 3, SSD1306_WHITE);
+		display.setCursor(57, 34);
+		display.print("---");
+	}
+
+	// GPS
+	display.setCursor(8, 50);
+	display.print("GPS");
+	if (raceboxGps) {
+		display.fillRoundRect(50, 48, 32, 12, 3, SSD1306_WHITE);
+		display.setTextColor(SSD1306_BLACK);
+		display.setCursor(57, 50);
+		display.print("FIX");
+		display.setTextColor(SSD1306_WHITE);
+	} else {
+		display.drawRoundRect(50, 48, 32, 12, 3, SSD1306_WHITE);
+		display.setCursor(57, 50);
+		display.print("---");
+	}
+
+	// show button press indicator
+	if (raceboxBtnUntilMs > 0 && millis() < raceboxBtnUntilMs) {
+		display.fillRoundRect(95, 0, 33, 10, 2, SSD1306_WHITE);
+		display.setTextColor(SSD1306_BLACK);
+		display.setCursor(98, 1);
+		display.print("BTN!");
+		display.setTextColor(SSD1306_WHITE);
+	}
+
+	display.display();
+}
+
 void calibrateRollOffset()
 {
 	display.clearDisplay();
@@ -1430,6 +1534,12 @@ void setup()
 	delay(200);
 
 	pinMode(BTN_PIN, INPUT_PULLUP);
+	pinMode(RACEBOX_BTN_PIN, OUTPUT);
+	digitalWrite(RACEBOX_BTN_PIN, HIGH); // relay inactive = HIGH
+	pinMode(RACEBOX_GPS_PIN, INPUT_PULLUP); // cathode: LOW = LED on
+	pinMode(RACEBOX_BLE_PIN, INPUT_PULLUP); // cathode: LOW = LED on
+	pinMode(RACEBOX_REC_PIN, INPUT_PULLUP); // cathode: LOW = LED on
+	pinMode(BLITZER_PIN, INPUT_PULLUP);  // LOW = blitzer detected (active low)
 
 	Wire.begin(SDA_PIN, SCL_PIN);
 	Wire.setClock(100000);
@@ -1528,6 +1638,13 @@ void loop()
 
 	saveMaxValuesSometimes();
 
+	// release relay after 1s
+	if (raceboxBtnUntilMs > 0 && millis() >= raceboxBtnUntilMs)
+	{
+		digitalWrite(RACEBOX_BTN_PIN, HIGH); // relay inactive = HIGH
+		raceboxBtnUntilMs = 0;
+	}
+
 	static unsigned long lastDraw = 0;
 	unsigned long now = millis();
 
@@ -1535,7 +1652,42 @@ void loop()
 	{
 		lastDraw = now;
 
-		if (page == PAGE_OIL)
+		// read RaceBox status pins every frame
+		// GPS debounce
+		bool gpsRaw = digitalRead(RACEBOX_GPS_PIN) == LOW;
+		if (gpsRaw != raceboxGpsRaw) { raceboxGpsRaw = gpsRaw; raceboxGpsChangeMs = millis(); }
+		if ((millis() - raceboxGpsChangeMs) >= RACEBOX_DEBOUNCE_MS) raceboxGps = raceboxGpsRaw;
+		// BLE debounce
+		bool bleRaw = digitalRead(RACEBOX_BLE_PIN) == LOW;
+		if (bleRaw != raceboxBleRaw) { raceboxBleRaw = bleRaw; raceboxBleChangeMs = millis(); }
+		if ((millis() - raceboxBleChangeMs) >= RACEBOX_DEBOUNCE_MS) raceboxBle = raceboxBleRaw;
+		// REC blinks when recording - hold active for 3s after last blink
+		if (digitalRead(RACEBOX_REC_PIN) == LOW)
+			raceboxRecLastActiveMs = millis();
+		raceboxRec = (millis() - raceboxRecLastActiveMs) < RACEBOX_REC_HOLD_MS;
+
+		// detect blitzer pulse (falling edge: HIGH->LOW = buzzer fires)
+		bool blitzerNow = digitalRead(BLITZER_PIN);
+		if (blitzerPinLast == true && blitzerNow == false)
+			blitzerActiveUntilMs = millis() + 5000;
+		blitzerPinLast = blitzerNow;
+
+		// blitzer overlay takes over entire display
+		if (millis() < blitzerActiveUntilMs)
+		{
+			bool flashOn = ((millis() / 200) % 2) == 0;
+			display.clearDisplay();
+			if (flashOn)
+				display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
+			display.setTextColor(flashOn ? SSD1306_BLACK : SSD1306_WHITE);
+			display.setFont(&FreeSansBold18pt7b);
+			display.setCursor(4, 44);
+			display.print("BLITZ!");
+			display.setFont();
+			display.setTextColor(SSD1306_WHITE);
+			display.display();
+		}
+		else if (page == PAGE_OIL)
 		{
 			drawOilPage(oilTempCached);
 		}
@@ -1543,9 +1695,13 @@ void loop()
 		{
 			drawLeanPage();
 		}
-		else
+		else if (page == PAGE_G)
 		{
 			drawGPage();
+		}
+		else
+		{
+			drawRaceBoxPage();
 		}
 	}
 
