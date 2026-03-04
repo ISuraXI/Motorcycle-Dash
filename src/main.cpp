@@ -71,9 +71,12 @@ bool bhOk = false;
 Adafruit_ADS1115 ads; // default I2C address 0x48
 
 // channels
-#define ADS_CH_OIL 0 // A0: oil temperature NTC
-// #define ADS_CH_OUTSIDE    1  // not used anymore, replaced by DS18B20
-#define ADS_CH_BATT 2 // A2: battery voltage divider
+#define ADS_CH_OIL            0 // A0: oil temperature NTC
+#define ADS_CH_BLITZER_ALIVE  1 // A1: Blitzer-Warner heartbeat LED line
+#define ADS_CH_BATT           2 // A2: battery voltage divider
+
+// Voltage threshold: idle=~2.6V, pulse=~3.5V → detect >3.0V as heartbeat
+#define BLITZER_ALIVE_V_THRESHOLD 3.0f
 
 // we will use gain = 1 (±4.096V) which gives 1 LSB = 125µV
 #define ADS_GAIN GAIN_ONE
@@ -106,10 +109,11 @@ const float OIL_EMA_ALPHA = 0.15f;  // smoothing factor for oil temp
 float battVoltageCached = NAN;
 const float BATT_EMA_ALPHA = 0.2f;  // smoothing factor for battery
 
-// round-robin ADS1115 scheduling: one read per loop, alternate channels
+// round-robin ADS1115 scheduling: one read per loop, rotate channels
+// slot 0 = oil (ADS ch0), slot 1 = Blitzer alive (ADS ch1), slot 2 = battery (ADS ch2)
 unsigned long lastAdsReadMs = 0;
 const unsigned long ADS_READ_INTERVAL_MS = 100;  // one ADS read every 100ms
-uint8_t adsNextChannel = 0;  // 0 = oil, 1 = battery
+uint8_t adsNextChannel = 0;  // 0 = oil, 1 = blitzer alive, 2 = battery
 
 // ADS1115 init flag
 bool adsOk = false;
@@ -148,9 +152,11 @@ enum Page : uint8_t
 bool raceboxGps = false;
 bool raceboxBle = false;
 bool raceboxRec = false;
-unsigned long raceboxRecLastActiveMs = 0; // for blink stabilization
+unsigned long raceboxRecLastActiveMs = 0;
+bool raceboxRecEverSeen  = false;
+unsigned long raceboxRecLowSinceMs  = 0; // debounce for EverSeen
 #define RACEBOX_REC_HOLD_MS 3000
-#define RACEBOX_BTN_PIN 32  // OUTPUT: drives relay to simulate RaceBox button press (active LOW)
+#define RACEBOX_BTN_PIN 32  // OUTPUT: drives NPN transistor to simulate RaceBox button press (active HIGH)
 unsigned long raceboxBtnUntilMs = 0;    // when to release the simulated button
 unsigned long raceboxBtnCooldownMs = 0; // prevent re-trigger while holding
 bool raceboxBtnArmed = true;            // only fire once per button press cycle
@@ -159,7 +165,16 @@ bool raceboxBtnArmed = true;            // only fire once per button press cycle
 // ---------------- Blitzer Warner ----------------
 #define BLITZER_PIN 14
 unsigned long blitzerActiveUntilMs = 0;
-bool blitzerPinLast = true; // for edge detection (HIGH = idle with PULLUP)
+bool blitzerPinLast = true;        // for edge detection (HIGH = idle with PULLUP)
+unsigned long blitzerLowSinceMs = 0; // debounce: timestamp when pin first went LOW
+#define BLITZER_DEBOUNCE_MS 30       // pin must stay LOW this long before triggering
+
+// Blitzer Warner heartbeat: LED blinks every ~5s to signal device is running
+// Idle voltage ~2.6V, pulse voltage ~3.5V -> detected via ADS1115 channel 1
+// Wire: LED+ -> AIN1 on ADS1115 board (GND already shared)
+#define BLITZER_ALIVE_TIMEOUT_MS 12000  // >12s without pulse = Warner offline
+bool blitzerAliveReceived   = false;    // true once the first heartbeat arrived
+unsigned long blitzerAliveLastMs = 0;   // timestamp of last heartbeat pulse
 
 // debounce for GPS and BLE (must be stable for 300ms before accepting)
 #define RACEBOX_DEBOUNCE_MS 300
@@ -167,6 +182,14 @@ bool raceboxGpsRaw = false;
 bool raceboxBleRaw = false;
 unsigned long raceboxGpsChangeMs = 0;
 unsigned long raceboxBleChangeMs = 0;
+unsigned long raceboxBleLastActiveMs = 0;
+#define RACEBOX_BLE_HOLD_MS 3000
+bool raceboxBleEverSeen  = false;
+unsigned long raceboxBleLowSinceMs  = 0; // debounce for EverSeen
+unsigned long raceboxGpsLastActiveMs = 0;
+#define RACEBOX_GPS_HOLD_MS 3000
+bool raceboxGpsEverSeen  = false;
+unsigned long raceboxGpsLowSinceMs  = 0; // debounce for EverSeen
 Page page = PAGE_OIL;
 
 #define BTN_PIN 13
@@ -283,6 +306,7 @@ void drawLeanSemiGauge(float rollDeg);
 void drawHatchedRect(int x, int y, int w, int h, int spacing = 3);
 void drawOilBar(float oilC);
 void drawOilPage(float oilC);
+void drawBlitzerWarnerAliveIndicator();
 
 void drawLeanPage();
 
@@ -492,7 +516,7 @@ void buttonUpdate()
 			}
 			else if (page == PAGE_RACEBOX && raceboxBtnArmed)
 			{
-				digitalWrite(RACEBOX_BTN_PIN, LOW); // relay active = LOW
+				digitalWrite(RACEBOX_BTN_PIN, HIGH); // transistor on = button pressed
 				raceboxBtnUntilMs = now + 1000;
 				raceboxBtnArmed = false;
 			}
@@ -588,7 +612,7 @@ float readBatteryVoltage()
 	return v * (BATT_R_TOP + BATT_R_BOT) / BATT_R_BOT;
 }
 
-// updateAdsReadings: one ADS1115 read per call, alternating oil/battery
+// updateAdsReadings: one ADS1115 read per call, rotating through 3 channels
 void updateAdsReadings()
 {
 	if (!adsOk)
@@ -603,6 +627,17 @@ void updateAdsReadings()
 		// oil temp
 		updateOilTemp();
 		adsNextChannel = 1;
+	}
+	else if (adsNextChannel == 1)
+	{
+		// Blitzer-Warner heartbeat: pulse raises line from ~2.6V to ~3.5V
+		float v = readAdsVoltage(ADS_CH_BLITZER_ALIVE);
+		if (!isnan(v) && v > BLITZER_ALIVE_V_THRESHOLD)
+		{
+			blitzerAliveLastMs   = now;
+			blitzerAliveReceived = true;
+		}
+		adsNextChannel = 2;
 	}
 	else
 	{
@@ -943,6 +978,23 @@ void drawHatchedRect(int x, int y, int w, int h, int spacing)
 	}
 }
 
+// Small heartbeat indicator: filled circle = alive, blinking = offline, nothing = initialising
+// Drawn at top-left corner (radius 2, center (2,4)) – 4px wide, sits just left of outside-temp text.
+void drawBlitzerWarnerAliveIndicator()
+{
+	// Nur anzeigen wenn Warner schon mal da war, aber jetzt offline ist
+	if (!blitzerAliveReceived)
+		return;
+
+	bool alive = (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
+	if (alive)
+		return; // läuft normal → kein Punkt
+
+	// Warner offline → blinkender Kreis als Warnung
+	if (((millis() / 400) % 2) == 0)
+		display.drawCircle(2, 4, 2, SSD1306_WHITE);
+}
+
 void drawOilBar(float oilC)
 {
 	const int x = 10;
@@ -1064,6 +1116,7 @@ void drawOilPage(float oilC)
 	}
 
 	drawOilBar(oilC);
+	drawBlitzerWarnerAliveIndicator();
 	display.display();
 }
 
@@ -1122,6 +1175,7 @@ void drawLeanPage()
 		}
 	}
 
+	drawBlitzerWarnerAliveIndicator();
 	display.display();
 }
 
@@ -1187,6 +1241,7 @@ void drawGPage()
 		}
 	}
 
+	drawBlitzerWarnerAliveIndicator();
 	display.display();
 }
 
@@ -1197,65 +1252,94 @@ void drawRaceBoxPage()
 	display.setFont();
 	display.setTextSize(1);
 
-	// Title
-	display.setCursor(34, 0);
-	display.print("RaceBox");
-	display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+	// Hilfsfunktion: Text horizontal im Badge zentrieren
+	auto printCentered = [&](int bx, int bw, int ty, const char* text) {
+		int16_t x1, y1; uint16_t tw, th;
+		display.getTextBounds(text, 0, ty, &x1, &y1, &tw, &th);
+		display.setCursor(bx + ((int16_t)bw - (int16_t)tw) / 2, ty);
+		display.print(text);
+	};
 
-	// BLE
-	display.setCursor(8, 18);
+	// Titel zentriert
+	{
+		const char* title = "RaceBox";
+		int16_t x1, y1; uint16_t tw, th;
+		display.getTextBounds(title, 0, 0, &x1, &y1, &tw, &th);
+		display.setCursor((128 - (int16_t)tw) / 2, 0);
+		display.print(title);
+	}
+	display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+
+	const int BX = 50, BW = 32; // Badge x und Breite
+
+	// BLE  (row 1)
+	display.setCursor(8, 12);
 	display.print("BLE");
 	if (raceboxBle) {
-		display.fillRoundRect(50, 16, 32, 12, 3, SSD1306_WHITE);
+		display.fillRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
 		display.setTextColor(SSD1306_BLACK);
-		display.setCursor(54, 18);
-		display.print("CONN");
+		printCentered(BX, BW, 12, "CONN");
 		display.setTextColor(SSD1306_WHITE);
 	} else {
-		display.drawRoundRect(50, 16, 32, 12, 3, SSD1306_WHITE);
-		display.setCursor(57, 18);
-		display.print("---");
+		display.drawRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
+		printCentered(BX, BW, 12, "---");
 	}
 
-	// REC
-	display.setCursor(8, 34);
+	// REC  (row 2)
+	display.setCursor(8, 25);
 	display.print("REC");
 	if (raceboxRec) {
-		display.fillRoundRect(50, 32, 32, 12, 3, SSD1306_WHITE);
+		display.fillRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
 		display.setTextColor(SSD1306_BLACK);
-		display.setCursor(54, 34);
-		display.print(" REC");
+		printCentered(BX, BW, 25, "REC");
 		display.setTextColor(SSD1306_WHITE);
 	} else {
-		display.drawRoundRect(50, 32, 32, 12, 3, SSD1306_WHITE);
-		display.setCursor(57, 34);
-		display.print("---");
+		display.drawRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
+		printCentered(BX, BW, 25, "---");
 	}
 
-	// GPS
-	display.setCursor(8, 50);
+	// GPS  (row 3)
+	display.setCursor(8, 38);
 	display.print("GPS");
 	if (raceboxGps) {
-		display.fillRoundRect(50, 48, 32, 12, 3, SSD1306_WHITE);
+		display.fillRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
 		display.setTextColor(SSD1306_BLACK);
-		display.setCursor(57, 50);
-		display.print("FIX");
+		printCentered(BX, BW, 38, "FIX");
 		display.setTextColor(SSD1306_WHITE);
 	} else {
-		display.drawRoundRect(50, 48, 32, 12, 3, SSD1306_WHITE);
-		display.setCursor(57, 50);
-		display.print("---");
+		display.drawRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
+		printCentered(BX, BW, 38, "---");
 	}
 
-	// show button press indicator
+	// Blitzer Warner alive  (row 4)
+	display.setCursor(8, 51);
+	display.print("BLT");
+	{
+		bool alive = blitzerAliveReceived && (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
+		if (blitzerAliveReceived && alive) {
+			display.fillRoundRect(BX, 50, BW, 10, 3, SSD1306_WHITE);
+			display.setTextColor(SSD1306_BLACK);
+			printCentered(BX, BW, 51, "ON");
+			display.setTextColor(SSD1306_WHITE);
+		} else if (blitzerAliveReceived && !alive) {
+			if (((millis() / 400) % 2) == 0)
+				display.drawRoundRect(BX, 50, BW, 10, 3, SSD1306_WHITE);
+			printCentered(BX, BW, 51, "OFF");
+		} else {
+			display.drawRoundRect(BX, 50, BW, 10, 3, SSD1306_WHITE);
+			printCentered(BX, BW, 51, "???");
+		}
+	}
+
+	// Schaltflächen-Indikator oben rechts
 	if (raceboxBtnUntilMs > 0 && millis() < raceboxBtnUntilMs) {
-		display.fillRoundRect(95, 0, 33, 10, 2, SSD1306_WHITE);
+		display.fillRoundRect(95, 0, 33, 9, 2, SSD1306_WHITE);
 		display.setTextColor(SSD1306_BLACK);
-		display.setCursor(98, 1);
-		display.print("BTN!");
+		printCentered(95, 33, 1, "REC");
 		display.setTextColor(SSD1306_WHITE);
 	}
 
+	drawBlitzerWarnerAliveIndicator();
 	display.display();
 }
 
@@ -1306,7 +1390,7 @@ void drawCalIconTopRight(bool bnoOK, bool armed)
 
 	const int16_t y = 6;
 	const int16_t x0 = 96;
-	const int16_t w = 32;
+	const int16_t w = 32; 
 	const int16_t h = 10;
 
 	// clear whole area each frame
@@ -1535,11 +1619,12 @@ void setup()
 
 	pinMode(BTN_PIN, INPUT_PULLUP);
 	pinMode(RACEBOX_BTN_PIN, OUTPUT);
-	digitalWrite(RACEBOX_BTN_PIN, HIGH); // relay inactive = HIGH
+	digitalWrite(RACEBOX_BTN_PIN, LOW); // transistor off = button open
 	pinMode(RACEBOX_GPS_PIN, INPUT_PULLUP); // cathode: LOW = LED on
 	pinMode(RACEBOX_BLE_PIN, INPUT_PULLUP); // cathode: LOW = LED on
 	pinMode(RACEBOX_REC_PIN, INPUT_PULLUP); // cathode: LOW = LED on
-	pinMode(BLITZER_PIN, INPUT_PULLUP);  // LOW = blitzer detected (active low)
+	pinMode(BLITZER_PIN, INPUT_PULLUP); // LOW = blitzer detected (active low)
+	// Blitzer-Warner heartbeat LED is measured via ADS1115 AIN1 (no GPIO needed)
 
 	Wire.begin(SDA_PIN, SCL_PIN);
 	Wire.setClock(100000);
@@ -1641,7 +1726,7 @@ void loop()
 	// release relay after 1s
 	if (raceboxBtnUntilMs > 0 && millis() >= raceboxBtnUntilMs)
 	{
-		digitalWrite(RACEBOX_BTN_PIN, HIGH); // relay inactive = HIGH
+		digitalWrite(RACEBOX_BTN_PIN, LOW); // transistor off = button open
 		raceboxBtnUntilMs = 0;
 	}
 
@@ -1653,25 +1738,58 @@ void loop()
 		lastDraw = now;
 
 		// read RaceBox status pins every frame
-		// GPS debounce
-		bool gpsRaw = digitalRead(RACEBOX_GPS_PIN) == LOW;
-		if (gpsRaw != raceboxGpsRaw) { raceboxGpsRaw = gpsRaw; raceboxGpsChangeMs = millis(); }
-		if ((millis() - raceboxGpsChangeMs) >= RACEBOX_DEBOUNCE_MS) raceboxGps = raceboxGpsRaw;
-		// BLE debounce
-		bool bleRaw = digitalRead(RACEBOX_BLE_PIN) == LOW;
-		if (bleRaw != raceboxBleRaw) { raceboxBleRaw = bleRaw; raceboxBleChangeMs = millis(); }
-		if ((millis() - raceboxBleChangeMs) >= RACEBOX_DEBOUNCE_MS) raceboxBle = raceboxBleRaw;
-		// REC blinks when recording - hold active for 3s after last blink
-		if (digitalRead(RACEBOX_REC_PIN) == LOW)
-			raceboxRecLastActiveMs = millis();
-		raceboxRec = (millis() - raceboxRecLastActiveMs) < RACEBOX_REC_HOLD_MS;
+		// GPS
+		{
+			bool raw = digitalRead(RACEBOX_GPS_PIN) == LOW;
+			if (!raw) {
+				raceboxGpsLowSinceMs = 0;
+			} else {
+				if (raceboxGpsLowSinceMs == 0) raceboxGpsLowSinceMs = millis();
+				if ((millis() - raceboxGpsLowSinceMs) >= RACEBOX_DEBOUNCE_MS)
+					{ raceboxGpsLastActiveMs = millis(); raceboxGpsEverSeen = true; }
+			}
+			raceboxGps = raceboxGpsEverSeen && (millis() - raceboxGpsLastActiveMs) < RACEBOX_GPS_HOLD_MS;
+		}
+		// BLE
+		{
+			bool raw = digitalRead(RACEBOX_BLE_PIN) == LOW;
+			if (!raw) {
+				raceboxBleLowSinceMs = 0;
+			} else {
+				if (raceboxBleLowSinceMs == 0) raceboxBleLowSinceMs = millis();
+				if ((millis() - raceboxBleLowSinceMs) >= RACEBOX_DEBOUNCE_MS)
+					{ raceboxBleLastActiveMs = millis(); raceboxBleEverSeen = true; }
+			}
+			raceboxBle = raceboxBleEverSeen && (millis() - raceboxBleLastActiveMs) < RACEBOX_BLE_HOLD_MS;
+		}
+		// REC – blinkt beim Aufnehmen, daher kürzerer Debounce (50ms reicht gegen Rauschen)
+		{
+			bool raw = digitalRead(RACEBOX_REC_PIN) == LOW;
+			if (!raw) {
+				raceboxRecLowSinceMs = 0;
+			} else {
+				if (raceboxRecLowSinceMs == 0) raceboxRecLowSinceMs = millis();
+				if ((millis() - raceboxRecLowSinceMs) >= 50)
+					{ raceboxRecLastActiveMs = millis(); raceboxRecEverSeen = true; }
+			}
+			raceboxRec = raceboxRecEverSeen && (millis() - raceboxRecLastActiveMs) < RACEBOX_REC_HOLD_MS;
+		}
 
-		// detect blitzer pulse (falling edge: HIGH->LOW = buzzer fires)
+		// detect blitzer pulse: pin must stay LOW for BLITZER_DEBOUNCE_MS to avoid noise
 		// ignore first 10s after boot to let blitzer warner initialize
 		bool blitzerNow = digitalRead(BLITZER_PIN);
-		if (millis() > 10000 && blitzerPinLast == true && blitzerNow == false)
-			blitzerActiveUntilMs = millis() + 5000;
+		if (blitzerNow == false) // pin is LOW
+		{
+			if (blitzerPinLast == true) // falling edge → start debounce timer
+				blitzerLowSinceMs = millis();
+			else if (millis() > 10000 &&
+			         (millis() - blitzerLowSinceMs) >= BLITZER_DEBOUNCE_MS &&
+			         blitzerActiveUntilMs <= millis()) // only trigger once per pulse
+				blitzerActiveUntilMs = millis() + 5000;
+		}
 		blitzerPinLast = blitzerNow;
+
+		// Blitzer-Warner heartbeat is sampled in updateAdsReadings() via AIN1
 
 		// blitzer overlay takes over entire display
 		if (millis() < blitzerActiveUntilMs)
