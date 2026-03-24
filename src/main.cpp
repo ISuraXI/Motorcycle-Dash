@@ -1,19 +1,61 @@
 /*
-  LoLin NodeMCU V3 (ESP8266) Dash
-  OLED: 1.51" Transparent OLED (SSD1309) 128x64 via SPI
-  BNO085: Lean angle (GAME_ROTATION_VECTOR, no mag) + G-Force (Linear Accel) via I2C
-  BH1750 (GY-302): Night Mode 2.0 (contrast soft fade + optional invert)
-  Oil temp: analog A0 (NTC Beta)
-  Button: D3 -> GND (INPUT_PULLUP)
+  ESP32-S3 N16R8 Motorrad-Dash
+  MCU   : ESP32-S3 (N16R8 – 16 MB Flash QIO, 8 MB PSRAM OPI)
+
+  Hardware & GPIO assignment
+  ──────────────────────────
+  I2C bus (BNO085 + BH1750 + ADS1115)
+    SDA  = GPIO 8
+    SCL  = GPIO 9
+
+  OLED 1.51" Transparent (SSD1309 / SSD1306) 128×64 – SPI2
+    DIN/MOSI = GPIO 11  (SPI2_MOSI)
+    CLK/SCK  = GPIO 12  (SPI2_SCK)
+    CS       = GPIO 10
+    DC       = GPIO 5
+    RST      = GPIO 6
+
+  BNO085 (I2C, address 0x4A)
+    → uses shared I2C bus above; no dedicated reset pin
+
+  BH1750 (I2C, address 0x23)
+    → uses shared I2C bus above
+
+  ADS1115 (I2C, address 0x48) – 4-channel 16-bit ADC
+    AIN0 = Oil temperature NTC
+    AIN1 = Blitzer-Warner heartbeat LED line (~2.6 V idle / ~3.5 V pulse)
+    AIN2 = Battery voltage divider
+    AIN3 = (free)
+
+  DS18B20 – Outside temperature 1-Wirex
+    DATA = GPIO 7
+
+  Button (main nav, INPUT_PULLUP → GND)
+    GPIO 4
+
+  Blitzer-Warner
+    Digital trigger (INPUT_PULLUP → LOW on alert)  = GPIO 14
+    Heartbeat LED anode (idle ~2.6 V, pulse ~3.5 V) = ADS1115 AIN1
+
+  RaceBox Mini inputs (all INPUT_PULLUP, HIGH = active)
+    GPS fix  = GPIO 15
+    BLE conn = GPIO 16
+    REC      = GPIO 17
+
+  RaceBox simulated button (NPN transistor, active HIGH)
+    GPIO 18
+
+  OIL_PIN (legacy NTC direct-ADC fallback, not actively used)
+    GPIO 1   ← oil temp is read via ADS1115 channel 0
 
   Pages (short press cycles): OIL -> LEAN -> G -> RACEBOX -> OIL ...
   Long press:
-   - LEAN: resets all-time max (EEPROM)
-   - G:    resets all-time max (EEPROM)
+   - LEAN : resets all-time max (EEPROM)
+   - G    : resets all-time max (EEPROM)
 
   Boot:
    - Screen shows immediately, sensors flip from "..." to OK/FAIL as they init
-   - Then waits 2s; during wait you can hold button to calibrate (CAL icon top-right)
+   - Then waits 2 s; during wait you can hold button to calibrate (CAL icon top-right)
 */
 
 #include <Wire.h>
@@ -35,23 +77,21 @@
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 
-// ---------------- I2C (ESP32 defaults: SDA=21, SCL=22)
-// Adjust these if your wiring differs
-#define SDA_PIN 21
-#define SCL_PIN 22
+// ---------------- I2C (ESP32-S3: SDA=8, SCL=9)
+#define SDA_PIN 8
+#define SCL_PIN 9
 
-// ---------------- OLED (SPI) ----------------
+// ---------------- OLED (SPI2) ----------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-// Example pins for ESP32 (change to match your wiring)
-// your module labels: VCC GND DIN CLK CS DC RST
-// map them to ESP32 pins below
-#define OLED_MOSI 23 // DIN -> MOSI
-#define OLED_CLK 18	 // CLK  -> SCK
-#define OLED_DC 16
-#define OLED_RST 17
-#define OLED_CS 4 // CS connected to GPIO4 on this board
+// ESP32-S3 SPI2 hardware pins
+// Module labels: VCC GND DIN CLK CS DC RST
+#define OLED_MOSI 11 // DIN  -> GPIO 11 (SPI2_MOSI)
+#define OLED_CLK  12 // CLK  -> GPIO 12 (SPI2_SCK)
+#define OLED_DC    5 // DC   -> GPIO 5
+#define OLED_RST   6 // RST  -> GPIO 6
+#define OLED_CS   10 // CS   -> GPIO 10
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, OLED_CS);
 
@@ -85,11 +125,12 @@ Adafruit_ADS1115 ads; // default I2C address 0x48
 #define DIVIDER_VCC 3.3f      // actual supply voltage of the NTC voltage divider
 
 // battery divider resistors (adjust to your hardware)
-const float BATT_R_TOP = 100000.0f; // between battery+ and A2
-const float BATT_R_BOT = 100000.0f; // between A2 and GND
+// 27k/10k: max measurable = 4.096V * (27k+10k)/10k = 15.15V → safe for 12V motorcycle system
+const float BATT_R_TOP = 27000.0f; // 27 kΩ between battery+ and A2
+const float BATT_R_BOT = 10000.0f; // 10 kΩ between A2 and GND
 
 // ---------------- one‑wire / outside temp ----------------
-#define ONE_WIRE_PIN 25 // GPIO25 - safe pin (GPIO2 is a strapping pin, avoid it)
+#define ONE_WIRE_PIN 7  // GPIO7 - safe on ESP32-S3 N16R8 (GPIO35-37 = PSRAM, avoid)
 OneWire oneWire(ONE_WIRE_PIN);
 DallasTemperature dsSensors(&oneWire);
 
@@ -145,9 +186,9 @@ enum Page : uint8_t
 };
 
 // ---------------- RaceBox status inputs ----------------
-#define RACEBOX_GPS_PIN 26  // HIGH when GPS fix active
-#define RACEBOX_BLE_PIN 27  // HIGH when BLE connected
-#define RACEBOX_REC_PIN 33  // HIGH when recording active
+#define RACEBOX_GPS_PIN 15  // HIGH when GPS fix active  (GPIO26-32 = flash on ESP32-S3, avoid)
+#define RACEBOX_BLE_PIN 16  // HIGH when BLE connected
+#define RACEBOX_REC_PIN 17  // HIGH when recording active
 
 bool raceboxGps = false;
 bool raceboxBle = false;
@@ -156,14 +197,14 @@ unsigned long raceboxRecLastActiveMs = 0;
 bool raceboxRecEverSeen  = false;
 unsigned long raceboxRecLowSinceMs  = 0; // debounce for EverSeen
 #define RACEBOX_REC_HOLD_MS 3000
-#define RACEBOX_BTN_PIN 32  // OUTPUT: drives NPN transistor to simulate RaceBox button press (active HIGH)
+#define RACEBOX_BTN_PIN 18  // OUTPUT: drives NPN transistor to simulate RaceBox button press (active HIGH)
 unsigned long raceboxBtnUntilMs = 0;    // when to release the simulated button
 unsigned long raceboxBtnCooldownMs = 0; // prevent re-trigger while holding
 bool raceboxBtnArmed = true;            // only fire once per button press cycle
 #define RACEBOX_LONGPRESS_MS 250        // shorter long press threshold for RaceBox page
 
 // ---------------- Blitzer Warner ----------------
-#define BLITZER_PIN 14
+#define BLITZER_PIN 14      // GPIO14 - safe on ESP32-S3 N16R8
 unsigned long blitzerActiveUntilMs = 0;
 bool blitzerPinLast = true;        // for edge detection (HIGH = idle with PULLUP)
 unsigned long blitzerLowSinceMs = 0; // debounce: timestamp when pin first went LOW
@@ -192,7 +233,7 @@ bool raceboxGpsEverSeen  = false;
 unsigned long raceboxGpsLowSinceMs  = 0; // debounce for EverSeen
 Page page = PAGE_OIL;
 
-#define BTN_PIN 13
+#define BTN_PIN  4          // GPIO4 - safe on ESP32-S3 N16R8 (GPIO13 = SPI2_MISO, avoid)
 #define DEBOUNCE_MS 15
 #define LONGPRESS_MS 800
 
@@ -210,8 +251,9 @@ struct ButtonState
 unsigned long resetAnimUntilMs = 0;
 
 // ---------------- Oil temp ----------------
-// On ESP32 use an ADC-capable GPIO (example: 35 -> ADC1_CH7)
-#define OIL_PIN 35
+// NOTE: OIL_PIN is a legacy fallback – oil temp is read via ADS1115 ch0.
+// GPIO35-37 are used for PSRAM on ESP32-S3 N16R8; remaped to GPIO1 (unused).
+#define OIL_PIN 1
 
 #define R_REF 10000.0
 #define R0 10000.0
@@ -565,7 +607,6 @@ void updateOutsideTemp()
 		dsSensors.requestTemperaturesByAddress(outsideSensorAddr);
 		outsideConvRequested = true;
 		lastOutsideMs = now;
-		Serial.println("DS18B20: first conversion requested");
 		return;
 	}
 
@@ -574,8 +615,6 @@ void updateOutsideTemp()
 		// 800ms is enough for 12-bit DS18B20 conversion
 		outsideConvRequested = false;
 		float t = dsSensors.getTempC(outsideSensorAddr);
-		Serial.print("DS18B20 raw: ");
-		Serial.println(t);
 		if (t != DEVICE_DISCONNECTED_C && t > -50.0f && t < 85.0f)
 			outsideTemp = t;
 		lastOutsideMs = now;
@@ -1634,20 +1673,11 @@ void setup()
 	delay(10);
 	dsSensors.begin();
 	dsSensors.setWaitForConversion(false);  // non-blocking mode!
-	Serial.print("OneWire device count: ");
-	Serial.println(dsSensors.getDeviceCount());
 
 	if (dsSensors.getDeviceCount() > 0 && dsSensors.getAddress(outsideSensorAddr, 0))
 	{
 		ds18b20Found = true;
 		dsSensors.setResolution(outsideSensorAddr, 12);
-		Serial.print("DS18B20 found, addr: ");
-		for (int i = 0; i < 8; i++)
-		{
-			if (outsideSensorAddr[i] < 16) Serial.print("0");
-			Serial.print(outsideSensorAddr[i], HEX);
-		}
-		Serial.println();
 	}
 	else
 	{
@@ -1673,19 +1703,12 @@ void setup()
 	// if you're using the default VSPI pins, SPI.begin() with no arguments is fine
 	// otherwise specify sck, miso, mosi, ss
 	SPI.begin(OLED_CLK, /*MISO*/ -1, OLED_MOSI, OLED_CS);
-	pinMode(OLED_CS, OUTPUT);
-	digitalWrite(OLED_CS, LOW); // keep chip selected
 
 	if (!display.begin(SSD1306_SWITCHCAPVCC))
 	{
-		Serial.println("OLED init failed!");
-		while (true)
-		{
-			delay(100);
-		}
+		while (true) { delay(100); }
 	}
-	Serial.println("OLED init ok");
-
+	
 	display.setRotation(0);
 	display.setTextColor(SSD1306_WHITE);
 	display.clearDisplay();
