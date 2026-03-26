@@ -1568,7 +1568,12 @@ void bootProgressInitAndMaybeCalibrate()
 	// ADS1115
 	adsOk = ads.begin();
 	stAds = adsOk ? 1 : 0;
-	if (adsOk) ads.setGain(ADS_GAIN);
+	if (adsOk) {
+		ads.setGain(ADS_GAIN);
+		// pre-fill oil temp cache so it shows immediately on first frame
+		float t = readOilTempOnce();
+		if (!isnan(t)) oilTempCached = t;
+	}
 	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.45f);
 
 	// BNO085
