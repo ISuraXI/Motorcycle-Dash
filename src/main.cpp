@@ -229,11 +229,22 @@ unsigned long raceboxBleChangeMs = 0;
 unsigned long raceboxBleLastActiveMs = 0;
 #define RACEBOX_BLE_HOLD_MS 3000
 bool raceboxBleEverSeen  = false;
-unsigned long raceboxBleLowSinceMs  = 0; // debounce for EverSeen
+unsigned long raceboxBleLowSinceMs  = 0;
+unsigned long raceboxBleHighSinceMs = 0;  // tracks continuous HIGH duration
+bool raceboxBlePinOk = false;             // true once pin was HIGH >= 200ms (filters boot blip + backfeed)
 unsigned long raceboxGpsLastActiveMs = 0;
 #define RACEBOX_GPS_HOLD_MS 3000
 bool raceboxGpsEverSeen  = false;
-unsigned long raceboxGpsLowSinceMs  = 0; // debounce for EverSeen
+unsigned long raceboxGpsLowSinceMs  = 0;
+unsigned long raceboxGpsHighSinceMs = 0;
+bool raceboxGpsPinOk = false;
+bool raceboxRecPinOk = false;
+unsigned long raceboxRecHighSinceMs = 0;
+// How long a pin must stay HIGH before LOW triggers are accepted.
+// BLE/GPS: 500ms – catches RaceBox boot-up OFF window, filters backfeed (constant LOW, no inter-blink HIGH)
+// REC:     2000ms – LED stays HIGH when not recording, so PinOk sets easily; backfeed safely filtered
+#define RACEBOX_PIN_VALID_HIGH_BLE_GPS_MS 500
+#define RACEBOX_PIN_VALID_HIGH_REC_MS     2000
 Page page = PAGE_OIL;
 
 #define BTN_PIN  4          // GPIO4 - safe on ESP32-S3 N16R8 (GPIO13 = SPI2_MISO, avoid)
@@ -1764,41 +1775,67 @@ void loop()
 		lastDraw = now;
 
 		// read RaceBox status pins every frame
+		// Pins müssen >= 2s kontinuierlich HIGH sein bevor LOW zählt.
+		// Verhindert false-trigger durch Boot-Blip (~ms) oder Backfeed wenn Gerät aus ist (dauerhaft LOW).
 		// GPS
 		{
-			bool raw = digitalRead(RACEBOX_GPS_PIN) == LOW;
-			if (!raw) {
+			bool isLow = digitalRead(RACEBOX_GPS_PIN) == LOW;
+			if (!isLow) {
+				if (raceboxGpsHighSinceMs == 0) raceboxGpsHighSinceMs = millis();
 				raceboxGpsLowSinceMs = 0;
+				if (!raceboxGpsPinOk && (millis() - raceboxGpsHighSinceMs) >= RACEBOX_PIN_VALID_HIGH_BLE_GPS_MS)
+					raceboxGpsPinOk = true;
 			} else {
-				if (raceboxGpsLowSinceMs == 0) raceboxGpsLowSinceMs = millis();
-				if ((millis() - raceboxGpsLowSinceMs) >= RACEBOX_DEBOUNCE_MS)
-					{ raceboxGpsLastActiveMs = millis(); raceboxGpsEverSeen = true; }
+				raceboxGpsHighSinceMs = 0;
+				if (raceboxGpsPinOk) {
+					if (raceboxGpsLowSinceMs == 0) raceboxGpsLowSinceMs = millis();
+					if ((millis() - raceboxGpsLowSinceMs) >= RACEBOX_DEBOUNCE_MS)
+						{ raceboxGpsLastActiveMs = millis(); raceboxGpsEverSeen = true; }
+				}
 			}
-			raceboxGps = raceboxGpsEverSeen && (millis() - raceboxGpsLastActiveMs) < RACEBOX_GPS_HOLD_MS;
+			if (raceboxGpsEverSeen && (millis() - raceboxGpsLastActiveMs) >= RACEBOX_GPS_HOLD_MS)
+				raceboxGpsEverSeen = false;
+			raceboxGps = raceboxGpsEverSeen;
 		}
-		// BLE
+		// BLE – 1000ms Debounce: Suchen = kurze Blinks (<1s) werden ignoriert
 		{
-			bool raw = digitalRead(RACEBOX_BLE_PIN) == LOW;
-			if (!raw) {
+			bool isLow = digitalRead(RACEBOX_BLE_PIN) == LOW;
+			if (!isLow) {
+				if (raceboxBleHighSinceMs == 0) raceboxBleHighSinceMs = millis();
 				raceboxBleLowSinceMs = 0;
+				if (!raceboxBlePinOk && (millis() - raceboxBleHighSinceMs) >= RACEBOX_PIN_VALID_HIGH_BLE_GPS_MS)
+					raceboxBlePinOk = true;
 			} else {
-				if (raceboxBleLowSinceMs == 0) raceboxBleLowSinceMs = millis();
-				if ((millis() - raceboxBleLowSinceMs) >= RACEBOX_DEBOUNCE_MS)
-					{ raceboxBleLastActiveMs = millis(); raceboxBleEverSeen = true; }
+				raceboxBleHighSinceMs = 0;
+				if (raceboxBlePinOk) {
+					if (raceboxBleLowSinceMs == 0) raceboxBleLowSinceMs = millis();
+					if ((millis() - raceboxBleLowSinceMs) >= 1000)
+						{ raceboxBleLastActiveMs = millis(); raceboxBleEverSeen = true; }
+				}
 			}
-			raceboxBle = raceboxBleEverSeen && (millis() - raceboxBleLastActiveMs) < RACEBOX_BLE_HOLD_MS;
+			if (raceboxBleEverSeen && (millis() - raceboxBleLastActiveMs) >= RACEBOX_BLE_HOLD_MS)
+				raceboxBleEverSeen = false;
+			raceboxBle = raceboxBleEverSeen;
 		}
-		// REC – blinkt beim Aufnehmen, daher kürzerer Debounce (50ms reicht gegen Rauschen)
+		// REC – 50ms Debounce reicht gegen Rauschen
 		{
-			bool raw = digitalRead(RACEBOX_REC_PIN) == LOW;
-			if (!raw) {
+			bool isLow = digitalRead(RACEBOX_REC_PIN) == LOW;
+			if (!isLow) {
+				if (raceboxRecHighSinceMs == 0) raceboxRecHighSinceMs = millis();
 				raceboxRecLowSinceMs = 0;
+				if (!raceboxRecPinOk && (millis() - raceboxRecHighSinceMs) >= RACEBOX_PIN_VALID_HIGH_REC_MS)
+					raceboxRecPinOk = true;
 			} else {
-				if (raceboxRecLowSinceMs == 0) raceboxRecLowSinceMs = millis();
-				if ((millis() - raceboxRecLowSinceMs) >= 50)
-					{ raceboxRecLastActiveMs = millis(); raceboxRecEverSeen = true; }
+				raceboxRecHighSinceMs = 0;
+				if (raceboxRecPinOk) {
+					if (raceboxRecLowSinceMs == 0) raceboxRecLowSinceMs = millis();
+					if ((millis() - raceboxRecLowSinceMs) >= 50)
+						{ raceboxRecLastActiveMs = millis(); raceboxRecEverSeen = true; }
+				}
 			}
-			raceboxRec = raceboxRecEverSeen && (millis() - raceboxRecLastActiveMs) < RACEBOX_REC_HOLD_MS;
+			if (raceboxRecEverSeen && (millis() - raceboxRecLastActiveMs) >= RACEBOX_REC_HOLD_MS)
+				raceboxRecEverSeen = false;
+			raceboxRec = raceboxRecEverSeen;
 		}
 
 		// detect blitzer pulse: pin must stay LOW for BLITZER_DEBOUNCE_MS to avoid noise
