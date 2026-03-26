@@ -315,11 +315,17 @@ unsigned long belowExitSinceMs = 0;
 
 float holdLean = 0.0f;
 unsigned long holdUntilMs = 0;
+int8_t lastCornerSign = 0;        // +1 = last corner was right, -1 = left
+bool cornerAboveThreshold = false; // true once cornerPeak exceeded 15° in this corner
+unsigned long cornerDeclineStartMs = 0; // when lean dropped back below 15° during active corner
 
 const float CORNER_ENTER_DEG = 8.0f;
 const float CORNER_EXIT_DEG = 4.0f;
 const uint16_t CORNER_EXIT_MS = 350;
-const uint16_t HOLD_AFTER_CORNER_MS = 2000;
+const uint16_t HOLD_AFTER_CORNER_MS = 4000;
+
+const float CENTER_PEAK_THRESHOLD = 15.0f;   // above this: show peak
+const float CENTER_OPPOSITE_CANCEL = 5.0f;   // opposite-side degrees to cancel hold
 
 // ---------------- G-Force ----------------
 const float G0 = 9.80665f;
@@ -777,12 +783,69 @@ void updateCurvePeakHold(float leanAbs)
 
 			holdUntilMs = 0;
 			holdLean = 0.0f;
+			cornerAboveThreshold = false;
+			cornerDeclineStartMs = 0;
+			lastCornerSign = (rollFiltered >= 0.0f) ? 1 : -1;
+		}
+		else
+		{
+			// Opposite-side cancel: if still in hold and rider crosses to other side
+			if (now < holdUntilMs)
+			{
+				bool cancel = (lastCornerSign > 0 && rollFiltered < -CENTER_OPPOSITE_CANCEL) ||
+				              (lastCornerSign < 0 && rollFiltered >  CENTER_OPPOSITE_CANCEL);
+				if (cancel)
+				{
+					holdUntilMs = 0;
+					holdLean    = 0.0f;
+				}
+			}
 		}
 		return;
 	}
 
+	// Direction reversal during active corner → immediately cancel peak display
+	{
+		bool reversed = (lastCornerSign > 0 && rollFiltered < -CENTER_OPPOSITE_CANCEL) ||
+		                (lastCornerSign < 0 && rollFiltered >  CENTER_OPPOSITE_CANCEL);
+		if (reversed)
+		{
+			cornerActive         = false;
+			cornerAboveThreshold = false;
+			belowExitSinceMs     = 0;
+			holdUntilMs          = 0;
+			holdLean             = 0.0f;
+			cornerPeak           = 0.0f;
+			cornerDeclineStartMs = 0;
+			// If already deep enough in the new direction, start fresh corner
+			if (leanAbs >= CORNER_ENTER_DEG)
+			{
+				cornerActive    = true;
+				cornerPeak      = leanAbs;
+				lastCornerSign  = (rollFiltered >= 0.0f) ? 1 : -1;
+			}
+			return;
+		}
+	}
+
 	if (leanAbs > cornerPeak)
 		cornerPeak = leanAbs;
+
+	if (cornerPeak >= CENTER_PEAK_THRESHOLD)
+		cornerAboveThreshold = true;
+
+	// Track when lean drops back below threshold after peak was reached
+	if (cornerAboveThreshold)
+	{
+		if (leanAbs >= CENTER_PEAK_THRESHOLD)
+		{
+			cornerDeclineStartMs = 0; // still above threshold, reset timer
+		}
+		else if (cornerDeclineStartMs == 0)
+		{
+			cornerDeclineStartMs = now; // just dropped below, start timer
+		}
+	}
 
 	if (leanAbs <= CORNER_EXIT_DEG)
 	{
@@ -794,9 +857,12 @@ void updateCurvePeakHold(float leanAbs)
 			cornerActive = false;
 			belowExitSinceMs = 0;
 
-			holdLean = cornerPeak;
-			holdUntilMs = now + HOLD_AFTER_CORNER_MS;
-
+			if (cornerAboveThreshold)
+			{
+				holdLean    = cornerPeak;
+				holdUntilMs = now + HOLD_AFTER_CORNER_MS;
+			}
+			cornerAboveThreshold = false;
 			cornerPeak = 0.0f;
 		}
 	}
@@ -1265,7 +1331,31 @@ void drawLeanPage()
 
 	float liveLean = fabs(rollUi);
 
-	drawCenteredBigNumberWithDegree((int)round(liveLean), 28);
+	// Hybrid center value:
+	//  corner active, peak >= 15°, and decline timer not expired → show running corner peak
+	//  in 4-sec hold after corner → show final corner peak
+	//  otherwise → show live lean
+	unsigned long nowMs = millis();
+	float centerValue;
+	bool declineExpired = cornerDeclineStartMs != 0 &&
+	                      (nowMs - cornerDeclineStartMs >= HOLD_AFTER_CORNER_MS);
+	// Only show live lean once the bike has crossed 2° to the opposite side of the peak
+	bool crossedOpposite = (lastCornerSign > 0 && rollFiltered < -5.0f) ||
+	                       (lastCornerSign < 0 && rollFiltered >  5.0f);
+	if (!crossedOpposite && cornerActive && cornerAboveThreshold && !declineExpired)
+	{
+		centerValue = cornerPeak;
+	}
+	else if (!crossedOpposite && nowMs < holdUntilMs)
+	{
+		centerValue = holdLean;
+	}
+	else
+	{
+		centerValue = liveLean;
+	}
+
+	drawCenteredBigNumberWithDegree((int)round(centerValue), 28);
 
 	display.setFont();
 	display.setTextSize(1);
