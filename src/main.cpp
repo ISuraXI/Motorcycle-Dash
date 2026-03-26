@@ -305,6 +305,8 @@ const float LEAN_DEADZONE_DEG = 2.0f;
 
 // All-time max (EEPROM)
 float maxLeanSaved = 0.0f;
+float maxLeanLeft  = 0.0f;  // all-time max lean to the left
+float maxLeanRight = 0.0f;  // all-time max lean to the right
 
 // Curve Peak Hold
 float cornerPeak = 0.0f;
@@ -330,8 +332,10 @@ float maxGSaved = 0.0f;
 #define EEPROM_SIZE 16
 #define EE_MAGIC 0x42
 #define EE_MAGIC_ADDR 0
-#define EE_MAXLEAN_ADDR 1 // uint16_t deg
-#define EE_MAXG_ADDR 3	  // uint16_t centi-g
+#define EE_MAXLEAN_ADDR   1 // uint16_t deg (combined abs max, kept for compat)
+#define EE_MAXG_ADDR      3 // uint16_t centi-g
+#define EE_MAXLEAN_L_ADDR 5 // uint16_t deg – max left lean
+#define EE_MAXLEAN_R_ADDR 7 // uint16_t deg – max right lean
 
 bool maxDirty = false;
 unsigned long lastEESaveMs = 0;
@@ -482,6 +486,16 @@ bool loadMaxValues()
 		vLean |= (uint16_t)EEPROM.read(EE_MAXLEAN_ADDR + 1) << 8;
 		maxLeanSaved = (float)vLean;
 
+		uint16_t vLL = 0;
+		vLL |= (uint16_t)EEPROM.read(EE_MAXLEAN_L_ADDR);
+		vLL |= (uint16_t)EEPROM.read(EE_MAXLEAN_L_ADDR + 1) << 8;
+		maxLeanLeft = (float)vLL;
+
+		uint16_t vLR = 0;
+		vLR |= (uint16_t)EEPROM.read(EE_MAXLEAN_R_ADDR);
+		vLR |= (uint16_t)EEPROM.read(EE_MAXLEAN_R_ADDR + 1) << 8;
+		maxLeanRight = (float)vLR;
+
 		uint16_t vG = 0;
 		vG |= (uint16_t)EEPROM.read(EE_MAXG_ADDR);
 		vG |= (uint16_t)EEPROM.read(EE_MAXG_ADDR + 1) << 8;
@@ -494,8 +508,10 @@ bool loadMaxValues()
 	}
 
 	// clamp to sane ranges (guard against uninitialized / corrupt EEPROM)
-	maxLeanSaved = clampf(maxLeanSaved, 0.0f, 90.0f);
-	maxGSaved    = clampf(maxGSaved,    0.0f, 9.99f);
+	maxLeanSaved  = clampf(maxLeanSaved,  0.0f, 90.0f);
+	maxLeanLeft   = clampf(maxLeanLeft,   0.0f, 90.0f);
+	maxLeanRight  = clampf(maxLeanRight,  0.0f, 90.0f);
+	maxGSaved     = clampf(maxGSaved,     0.0f, 9.99f);
 
 	// EEPROM OK test: write/read/restore one byte
 	uint8_t old = EEPROM.read(EE_MAGIC_ADDR);
@@ -516,15 +532,23 @@ bool loadMaxValues()
 void saveMaxValuesNow()
 {
 	uint16_t vLean = (uint16_t)round(maxLeanSaved);
-	uint16_t vG = (uint16_t)lroundf(clampf(maxGSaved, 0.0f, 9.99f) * 100.0f);
+	uint16_t vG    = (uint16_t)lroundf(clampf(maxGSaved, 0.0f, 9.99f) * 100.0f);
+	uint16_t vLL   = (uint16_t)round(maxLeanLeft);
+	uint16_t vLR   = (uint16_t)round(maxLeanRight);
 
 	EEPROM.write(EE_MAGIC_ADDR, EE_MAGIC);
 
-	EEPROM.write(EE_MAXLEAN_ADDR, (uint8_t)(vLean & 0xFF));
+	EEPROM.write(EE_MAXLEAN_ADDR,     (uint8_t)(vLean & 0xFF));
 	EEPROM.write(EE_MAXLEAN_ADDR + 1, (uint8_t)((vLean >> 8) & 0xFF));
 
-	EEPROM.write(EE_MAXG_ADDR, (uint8_t)(vG & 0xFF));
+	EEPROM.write(EE_MAXG_ADDR,     (uint8_t)(vG & 0xFF));
 	EEPROM.write(EE_MAXG_ADDR + 1, (uint8_t)((vG >> 8) & 0xFF));
+
+	EEPROM.write(EE_MAXLEAN_L_ADDR,     (uint8_t)(vLL & 0xFF));
+	EEPROM.write(EE_MAXLEAN_L_ADDR + 1, (uint8_t)((vLL >> 8) & 0xFF));
+
+	EEPROM.write(EE_MAXLEAN_R_ADDR,     (uint8_t)(vLR & 0xFF));
+	EEPROM.write(EE_MAXLEAN_R_ADDR + 1, (uint8_t)((vLR >> 8) & 0xFF));
 
 	EEPROM.commit();
 }
@@ -588,6 +612,8 @@ void buttonUpdate()
 			if (page == PAGE_LEAN)
 			{
 				maxLeanSaved = 0.0f;
+				maxLeanLeft  = 0.0f;
+				maxLeanRight = 0.0f;
 				maxDirty = true;
 				resetAnimUntilMs = now + 350;
 			}
@@ -814,6 +840,17 @@ void updateLean()
 	if (leanAbs > maxLeanSaved)
 	{
 		maxLeanSaved = leanAbs;
+		maxDirty = true;
+	}
+
+	if (rollFiltered < -LEAN_DEADZONE_DEG && leanAbs > maxLeanLeft)
+	{
+		maxLeanLeft = leanAbs;
+		maxDirty = true;
+	}
+	if (rollFiltered > LEAN_DEADZONE_DEG && leanAbs > maxLeanRight)
+	{
+		maxLeanRight = leanAbs;
 		maxDirty = true;
 	}
 
@@ -1227,34 +1264,26 @@ void drawLeanPage()
 	display.setTextColor(SSD1306_WHITE);
 
 	float liveLean = fabs(rollUi);
-	float peakShown;
-
-	if (millis() < holdUntilMs)
-		peakShown = holdLean;
-	else if (cornerActive)
-		peakShown = cornerPeak;
-	else
-		peakShown = 0.0f;
 
 	drawCenteredBigNumberWithDegree((int)round(liveLean), 28);
 
 	display.setFont();
 	display.setTextSize(1);
 
-	// Max overall (left)
+	// Max lean left (bottom-left)
 	display.setCursor(2, display.height() - 9);
-	display.print("M:");
-	display.print(maxLeanSaved, 0);
+	display.print("L:");
+	display.print(maxLeanLeft, 0);
 
-	// Peak (right, integer)
-	String pStr = "P:" + String((int)round(peakShown));
+	// Max lean right (bottom-right)
+	String rStr = "R:" + String((int)round(maxLeanRight));
 	int16_t x1, y1;
 	uint16_t w, h;
-	display.getTextBounds(pStr, 0, 0, &x1, &y1, &w, &h);
+	display.getTextBounds(rStr, 0, 0, &x1, &y1, &w, &h);
 	int16_t xRight = SCREEN_WIDTH - (int16_t)w;
 
 	display.setCursor(xRight, SCREEN_HEIGHT - 9);
-	display.print(pStr);
+	display.print(rStr);
 
 	drawLeanSemiGauge(rollUi);
 
