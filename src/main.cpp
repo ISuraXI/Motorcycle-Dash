@@ -337,6 +337,21 @@ const float G_DEADZONE      = 0.04f;   // Motorvibrationen < 0.04g werden ignori
 
 float maxGSaved = 0.0f;
 
+// 4 Quadranten × 2 stärkste Peaks (RAM-only, weg beim Neustart)
+// Quadrant: 0=rechts/vorne (+x/+y), 1=links/vorne (-x/+y),
+//           2=links/hinten (-x/-y), 3=rechts/hinten (+x/-y)
+struct GFPeak { float x; float y; float mag; };
+GFPeak gQuadPeaks[4][2];  // [quadrant][slot 0=stärker, 1=schwächer]
+bool   gQuadHasSlot[4][2];
+
+static uint8_t gQuadrant(float gx, float gy)
+{
+	if (gx >= 0.0f && gy >= 0.0f) return 0;
+	if (gx <  0.0f && gy >= 0.0f) return 1;
+	if (gx <  0.0f && gy <  0.0f) return 2;
+	return 3;
+}
+
 // ---------------- EEPROM ----------------
 #define EEPROM_SIZE 16
 #define EE_MAGIC 0x42
@@ -629,6 +644,8 @@ void buttonUpdate()
 			else if (page == PAGE_G)
 			{
 				maxGSaved = 0.0f;
+				memset(gQuadPeaks,   0, sizeof(gQuadPeaks));
+				memset(gQuadHasSlot, 0, sizeof(gQuadHasSlot));
 				maxDirty = true;
 				resetAnimUntilMs = now + 350;
 			}
@@ -951,6 +968,23 @@ void updateGForce()
 	{
 		maxGSaved = mag;
 		maxDirty = true;
+	}
+	// Quadranten-Peak-Puffer aktualisieren
+	{
+		uint8_t q = gQuadrant(gXFast, gYFast);
+		GFPeak np = { gXFast, gYFast, mag };
+		if (!gQuadHasSlot[q][0] || mag > gQuadPeaks[q][0].mag)
+		{
+			gQuadPeaks[q][1] = gQuadPeaks[q][0];
+			gQuadHasSlot[q][1] = gQuadHasSlot[q][0];
+			gQuadPeaks[q][0] = np;
+			gQuadHasSlot[q][0] = true;
+		}
+		else if (!gQuadHasSlot[q][1] || mag > gQuadPeaks[q][1].mag)
+		{
+			gQuadPeaks[q][1] = np;
+			gQuadHasSlot[q][1] = true;
+		}
 	}
 }
 
@@ -1415,34 +1449,84 @@ void drawGCircle(float gx, float gy, float maxGVal)
 {
 	const int16_t cx = 64;
 	const int16_t cy = 32;
-	const int16_t r = 26;
+	const int16_t r  = 26;
+	const float rangeG = 1.5f;
 
-	const float rangeG = 1.5f; // +/- 1.5g
-
-	display.drawCircle(cx, cy, r, SSD1306_WHITE);
+	// Fadenkreuz (volle Achslinien)
 	display.drawLine(cx - r, cy, cx + r, cy, SSD1306_WHITE);
 	display.drawLine(cx, cy - r, cx, cy + r, SSD1306_WHITE);
-	display.drawCircle(cx, cy, r / 2, SSD1306_WHITE);
+	// äußerer Ring: 1.5g
+	display.drawCircle(cx, cy, r, SSD1306_WHITE);
+	// innerer Ring: 0.75g
+	const int16_t rInner = (int16_t)lroundf((float)r * 0.5f);
+	display.drawCircle(cx, cy, rInner, SSD1306_WHITE);
 
+	// Ring-Legende: nur am äußeren Ring
+	display.setFont();
+	display.setTextSize(1);
+	display.setCursor(cx + r + 2, cy - 4);
+	display.print("1.5g");
+
+	// Peak-Marker: Punkte nach Winkel sortieren → sauberes Polygon
+	{
+		int16_t ptx[8], pty[8];
+		float   pta[8]; // Winkel für Sortierung
+		uint8_t ptCount = 0;
+		for (uint8_t q = 0; q < 4; q++)
+		{
+			for (uint8_t s = 0; s < 2; s++)
+			{
+				if (!gQuadHasSlot[q][s]) continue;
+				float px_f = clampf(gQuadPeaks[q][s].x, -rangeG, rangeG);
+				float py_f = clampf(gQuadPeaks[q][s].y, -rangeG, rangeG);
+				ptx[ptCount] = cx + (int16_t)lroundf((px_f / rangeG) * (float)(r - 2));
+				pty[ptCount] = cy - (int16_t)lroundf((py_f / rangeG) * (float)(r - 2));
+				pta[ptCount] = atan2f(py_f, px_f); // Winkel für Sortierung
+				ptCount++;
+			}
+		}
+		// Insertion-Sort nach Winkel (max 8 Elemente → kein Overhead)
+		for (uint8_t i = 1; i < ptCount; i++)
+		{
+			int16_t kx = ptx[i], ky = pty[i]; float ka = pta[i];
+			int8_t j = (int8_t)i - 1;
+			while (j >= 0 && pta[j] > ka)
+			{
+				ptx[j+1] = ptx[j]; pty[j+1] = pty[j]; pta[j+1] = pta[j];
+				j--;
+			}
+			ptx[j+1] = kx; pty[j+1] = ky; pta[j+1] = ka;
+		}
+		// Polygon zeichnen
+		for (uint8_t i = 0; i < ptCount; i++)
+		{
+			uint8_t j = (i + 1) % ptCount;
+			display.drawLine(ptx[i], pty[i], ptx[j], pty[j], SSD1306_WHITE);
+		}
+		// Punkte obendrauf
+		for (uint8_t i = 0; i < ptCount; i++)
+			display.drawCircle(ptx[i], pty[i], 2, SSD1306_WHITE);
+	}
+
+	// Aktuellen Punkt pushen + zeichnen
 	float x = clampf(gx, -rangeG, rangeG);
 	float y = clampf(gy, -rangeG, rangeG);
+	int16_t dx = cx + (int16_t)lroundf((x / rangeG) * (float)(r - 2));
+	int16_t dy = cy - (int16_t)lroundf((y / rangeG) * (float)(r - 2));
+	display.fillCircle(dx, dy, 3, SSD1306_WHITE);
 
-	int16_t px = cx + (int16_t)lroundf((x / rangeG) * (float)(r - 2));
-	int16_t py = cy - (int16_t)lroundf((y / rangeG) * (float)(r - 2));
-
-	display.fillCircle(px, py, 2, SSD1306_WHITE);
-
+	// Texte
 	display.setFont();
 	display.setTextSize(1);
 
 	float mag = sqrtf(gx * gx + gy * gy);
 	display.setCursor(1, 0);
-	display.print(mag, 2);
+	display.print(mag, 1);
 	display.print("g");
 
 	display.setCursor(1, display.height() - 9);
 	display.print("M:");
-	display.print(maxGVal, 2);
+	display.print(maxGVal, 1);
 	display.print("g");
 }
 
