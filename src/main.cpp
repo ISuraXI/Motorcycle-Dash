@@ -378,7 +378,7 @@ void showReadyScreen();
 // Progressive boot
 void drawCalIconTopRight(bool bnoOK, bool armed);
 static void drawSelfTestLineProgress(int y, const char *label, int8_t st);
-static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, bool calArmed, float prog01);
+static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, int8_t stAds, bool calArmed, float prog01);
 void bootProgressInitAndMaybeCalibrate();
 
 // =========================================================
@@ -1490,9 +1490,13 @@ static void drawSelfTestLineProgress(int y, const char *label, int8_t st)
 	display.setFont();
 	display.setTextSize(1);
 
+	// label links
 	display.setCursor(8, y);
 	display.print(label);
-	display.print(": ");
+
+	// status immer bei fester X-Position (60) → alle "OK" auf gleicher Höhe
+	const int16_t statusX = 60;
+	display.setCursor(statusX, y);
 
 	if (st < 0)
 	{
@@ -1509,22 +1513,16 @@ static void drawSelfTestLineProgress(int y, const char *label, int8_t st)
 		bool on = ((millis() / 160) % 2) == 0;
 		if (on)
 		{
-			String pre = String(label) + ": ";
-			int16_t x1, y1;
-			uint16_t w, h;
-			display.getTextBounds(pre, 0, y, &x1, &y1, &w, &h);
-			int16_t xFail = 8 + (int16_t)w;
-
-			display.fillRect(xFail - 1, y - 8, 30, 10, SSD1306_WHITE);
+			display.fillRect(statusX - 1, y - 1, 30, 10, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
-			display.setCursor(xFail, y);
+			display.setCursor(statusX, y);
 			display.print("FAIL");
 			display.setTextColor(SSD1306_WHITE);
 		}
 	}
 }
 
-static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, bool calArmed, float prog01)
+static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, int8_t stAds, bool calArmed, float prog01)
 {
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
@@ -1534,9 +1532,10 @@ static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, bool calA
 	display.setCursor(8, 6);
 	display.print("Self-Test");
 
-	drawSelfTestLineProgress(20, "BNO085", stBno);
-	drawSelfTestLineProgress(30, "BH1750", stBh);
-	drawSelfTestLineProgress(40, "EEPROM", stEe);
+	drawSelfTestLineProgress(20, "BNO085",  stBno);
+	drawSelfTestLineProgress(30, "BH1750",  stBh);
+	drawSelfTestLineProgress(40, "ADS1115", stAds);
+	drawSelfTestLineProgress(50, "EEPROM",  stEe);
 
 	drawCalIconTopRight(stBno > 0, calArmed);
 
@@ -1551,20 +1550,26 @@ static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, bool calA
 
 void bootProgressInitAndMaybeCalibrate()
 {
-	int8_t stBno = -1, stBh = -1, stEe = -1;
+	int8_t stBno = -1, stBh = -1, stEe = -1, stAds = -1;
 
 	// show instantly
-	renderBootProgress(stBno, stBh, stEe, false, 0.0f);
+	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.0f);
 
 	// EEPROM
 	eepromOk = loadMaxValues();
 	stEe = eepromOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, false, 0.2f);
+	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.15f);
 
 	// BH1750
 	bhOk = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
 	stBh = bhOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, false, 0.4f);
+	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.3f);
+
+	// ADS1115
+	adsOk = ads.begin();
+	stAds = adsOk ? 1 : 0;
+	if (adsOk) ads.setGain(ADS_GAIN);
+	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.45f);
 
 	// BNO085
 	bnoOk = bno.begin_I2C();
@@ -1577,7 +1582,7 @@ void bootProgressInitAndMaybeCalibrate()
 	}
 	rollOffsetDeg = -3.00f;  // hardcoded mount offset (measured)
 	stBno = bnoOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, false, 0.6f);
+	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.6f);
 
 	// kick off DS18B20 conversion now — will be ready after 2s wait
 	if (ds18b20Found)
@@ -1609,7 +1614,7 @@ void bootProgressInitAndMaybeCalibrate()
 			holdStart = 0;
 		}
 
-		renderBootProgress(stBno, stBh, stEe, calArmed, prog);
+		renderBootProgress(stBno, stBh, stEe, stAds, calArmed, prog);
 		delay(25);
 		yield();
 	}
@@ -1709,18 +1714,7 @@ void setup()
 		Serial.println(ONE_WIRE_PIN);
 	}
 
-	// initialize ADS1115 for analog measurements
-	if (!ads.begin())
-	{
-		Serial.println("ADS1115 not found!");
-		adsOk = false;
-	}
-	else
-	{
-		ads.setGain(ADS_GAIN);
-		adsOk = true;
-		Serial.println("ADS1115 ready");
-	}
+	// ADS1115 is initialized in bootProgressInitAndMaybeCalibrate()
 
 	// configure hardware SPI pins before display.begin
 	// if you're using the default VSPI pins, SPI.begin() with no arguments is fine
