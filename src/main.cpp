@@ -245,6 +245,8 @@ unsigned long raceboxRecHighSinceMs = 0;
 // REC:     2000ms – LED stays HIGH when not recording, so PinOk sets easily; backfeed safely filtered
 #define RACEBOX_PIN_VALID_HIGH_BLE_GPS_MS 500
 #define RACEBOX_PIN_VALID_HIGH_REC_MS     2000
+unsigned long raceboxBleAliveLastMs = 0;   // last time BLE pin was LOW after PinOk (= RaceBox is on)
+#define RACEBOX_BLE_ALIVE_TIMEOUT_MS 10000 // show "ON" for 10s after last blink
 Page page = PAGE_OIL;
 
 #define BTN_PIN  4          // GPIO4 - safe on ESP32-S3 N16R8 (GPIO13 = SPI2_MISO, avoid)
@@ -1328,14 +1330,21 @@ void drawRaceBoxPage()
 	// BLE  (row 1)
 	display.setCursor(8, 12);
 	display.print("BLE");
-	if (raceboxBle) {
-		display.fillRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
-		display.setTextColor(SSD1306_BLACK);
-		printCentered(BX, BW, 12, "CONN");
-		display.setTextColor(SSD1306_WHITE);
-	} else {
-		display.drawRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
-		printCentered(BX, BW, 12, "---");
+	{
+		bool bleAlive = raceboxBleAliveLastMs > 0 && (millis() - raceboxBleAliveLastMs) < RACEBOX_BLE_ALIVE_TIMEOUT_MS;
+		if (raceboxBle) {
+			display.fillRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
+			display.setTextColor(SSD1306_BLACK);
+			printCentered(BX, BW, 12, "CONN");
+			display.setTextColor(SSD1306_WHITE);
+		} else if (bleAlive) {
+			// RaceBox ist an, aber kein Phone verbunden
+			display.drawRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
+			printCentered(BX, BW, 12, "ON");
+		} else {
+			display.drawRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
+			printCentered(BX, BW, 12, "---");
+		}
 	}
 
 	// REC  (row 2)
@@ -1789,7 +1798,7 @@ void loop()
 				raceboxGpsHighSinceMs = 0;
 				if (raceboxGpsPinOk) {
 					if (raceboxGpsLowSinceMs == 0) raceboxGpsLowSinceMs = millis();
-					if ((millis() - raceboxGpsLowSinceMs) >= RACEBOX_DEBOUNCE_MS)
+					if ((millis() - raceboxGpsLowSinceMs) >= 6000) // 6s: filters boot flash, real fix stays on minutes
 						{ raceboxGpsLastActiveMs = millis(); raceboxGpsEverSeen = true; }
 				}
 			}
@@ -1797,7 +1806,8 @@ void loop()
 				raceboxGpsEverSeen = false;
 			raceboxGps = raceboxGpsEverSeen;
 		}
-		// BLE – 1000ms Debounce: Suchen = kurze Blinks (<1s) werden ignoriert
+		// BLE – 1000ms Debounce: Suchen = kurze Blinks (<1s) werden ignoriert für CONN;
+		// jeder Blink (>0ms nach PinOk) aktualisiert raceboxBleAliveLastMs → zeigt "ON"
 		{
 			bool isLow = digitalRead(RACEBOX_BLE_PIN) == LOW;
 			if (!isLow) {
@@ -1808,6 +1818,7 @@ void loop()
 			} else {
 				raceboxBleHighSinceMs = 0;
 				if (raceboxBlePinOk) {
+					raceboxBleAliveLastMs = millis(); // jeder LOW-Moment nach PinOk = Gerät ist an
 					if (raceboxBleLowSinceMs == 0) raceboxBleLowSinceMs = millis();
 					if ((millis() - raceboxBleLowSinceMs) >= 1000)
 						{ raceboxBleLastActiveMs = millis(); raceboxBleEverSeen = true; }
