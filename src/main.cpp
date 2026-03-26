@@ -684,7 +684,10 @@ float readOilTempOnce()
 
 	float rNtc = R_REF * v / (DIVIDER_VCC - v);
 	float tempK = 1.0f / ((1.0f / (T0C + 273.15f)) + (1.0f / BETA) * logf(rNtc / R0));
-	return tempK - 273.15f;
+	float tempC = tempK - 273.15f;
+	if (tempC < -20.0f || tempC > 160.0f)
+		return NAN;
+	return tempC;
 }
 
 void updateOutsideTemp()
@@ -1826,9 +1829,13 @@ void bootProgressInitAndMaybeCalibrate()
 	stAds = adsOk ? 1 : 0;
 	if (adsOk) {
 		ads.setGain(ADS_GAIN);
-		// pre-fill oil temp cache so it shows immediately on first frame
-		float t = readOilTempOnce();
-		if (!isnan(t)) oilTempCached = t;
+		delay(5);  // let ADS settle after gain change
+		// pre-fill oil temp: retry up to 5× so first frame always shows a reading
+		for (int attempt = 0; attempt < 5 && isnan(oilTempCached); attempt++) {
+			float t = readOilTempOnce();
+			if (!isnan(t)) oilTempCached = t;
+			else delay(20);
+		}
 	}
 	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.45f);
 
@@ -1875,6 +1882,7 @@ void bootProgressInitAndMaybeCalibrate()
 			holdStart = 0;
 		}
 
+		updateAdsReadings();  // keep pumping ADS during splash so oil temp is ready
 		renderBootProgress(stBno, stBh, stEe, stAds, calArmed, prog);
 		delay(25);
 		yield();
