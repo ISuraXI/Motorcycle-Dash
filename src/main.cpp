@@ -131,6 +131,11 @@ const float BATT_R_BOT = 10000.0f; // 10 kΩ between A2 and GND
 // calibration: measured_real / measured_displayed (set 1.0 to disable)
 // e.g. multimeter shows 12.1V, display shows 12.0V → 12.1/12.0 = 1.00833
 const float BATT_CAL = 1.00833f;
+const float BATT_LOW_V = 10.5f;    // battery low warning threshold (flash text)
+
+// ---- Test mode: comment out to disable ----
+// #define TEST_MODE
+// When active: oil temp cycles -5..120°C, lean angle cycles -90..+90°
 
 // ---------------- one‑wire / outside temp ----------------
 #define ONE_WIRE_PIN 7  // GPIO7 - safe on ESP32-S3 N16R8 (GPIO35-37 = PSRAM, avoid)
@@ -148,6 +153,9 @@ bool ds18b20Found = false;          // sensor discovered?
 // oil temperature cache
 float oilTempCached = NAN;
 const float OIL_EMA_ALPHA = 0.15f;  // smoothing factor for oil temp
+
+// DS18B20 calibration offset (add to raw reading)
+const float DS18B20_OFFSET = -1.2f;
 
 // battery voltage cache
 float battVoltageCached = NAN;
@@ -281,8 +289,9 @@ unsigned long resetAnimUntilMs = 0;
 
 const float OIL_BAR_MIN_C = 0.0f;
 const float OIL_BAR_MAX_C = 120.0f;
-const float OIL_GOOD_MIN = 80.0f;
+const float OIL_GOOD_MIN = 70.0f;
 const float OIL_GOOD_MAX = 90.0f;
+const float OIL_CRITICAL_C = 110.0f; // above this: full-screen warning overlay
 
 // ---------------- Lean ----------------
 float rollFiltered = 0.0f;
@@ -365,6 +374,7 @@ void drawHatchedRect(int x, int y, int w, int h, int spacing = 3);
 void drawOilBar(float oilC);
 void drawOilPage(float oilC);
 void drawBlitzerWarnerAliveIndicator();
+static void drawBatteryTopRight();
 
 void drawLeanPage();
 
@@ -427,6 +437,17 @@ static float normalizeAngleDeg(float a)
 		a += 360.0f;
 	return a;
 }
+// Triangle wave: lo..hi and back, full cycle = periodMs
+static float triangleWave(float lo, float hi, unsigned long periodMs)
+{
+	unsigned long t = millis() % periodMs;
+	float half = periodMs / 2.0f;
+	float frac = (t < (unsigned long)half)
+		? (float)t / half
+		: 1.0f - ((float)(t - (unsigned long)half) / half);
+	return lo + frac * (hi - lo);
+}
+
 static float clampf(float v, float lo, float hi)
 {
 	if (v < lo)
@@ -471,6 +492,10 @@ bool loadMaxValues()
 		maxLeanSaved = 0.0f;
 		maxGSaved = 0.0f;
 	}
+
+	// clamp to sane ranges (guard against uninitialized / corrupt EEPROM)
+	maxLeanSaved = clampf(maxLeanSaved, 0.0f, 90.0f);
+	maxGSaved    = clampf(maxGSaved,    0.0f, 9.99f);
 
 	// EEPROM OK test: write/read/restore one byte
 	uint8_t old = EEPROM.read(EE_MAGIC_ADDR);
@@ -632,7 +657,7 @@ void updateOutsideTemp()
 		outsideConvRequested = false;
 		float t = dsSensors.getTempC(outsideSensorAddr);
 		if (t != DEVICE_DISCONNECTED_C && t > -50.0f && t < 85.0f)
-			outsideTemp = t;
+			outsideTemp = t + DS18B20_OFFSET;
 		lastOutsideMs = now;
 		return;
 	}
@@ -1070,21 +1095,22 @@ void drawOilBar(float oilC)
 	}
 	int gw = gx2 - gx1 + 1;
 
+	int fillRight = x + 1; // right edge of the solid fill
 	if (valid)
 	{
 		float t = clampf(oilC, OIL_BAR_MIN_C, OIL_BAR_MAX_C);
 		int fillW = mapf_to_i(t, OIL_BAR_MIN_C, OIL_BAR_MAX_C, 0, w - 2);
 		if (fillW > 0)
+		{
 			display.fillRect(x + 1, y + 1, fillW, h - 2, SSD1306_WHITE);
+			fillRight = x + 1 + fillW;
+		}
 	}
-
-	if (gw > 0)
-		drawHatchedRect(gx1, y + 1, gw, h - 2, 3);
 
 	display.drawFastVLine(gx1, y - 2, h + 4, SSD1306_WHITE);
 	display.drawFastVLine(gx2, y - 2, h + 4, SSD1306_WHITE);
 
-	if (valid && oilC > OIL_GOOD_MAX)
+	if (valid && oilC > 100.0f)
 	{
 		bool on = ((millis() / 140) % 2) == 0;
 		if (on)
@@ -1100,6 +1126,38 @@ void drawOilBar(float oilC)
 // fixed margin from screen edge used for both outside temp and battery
 #define SIDE_MARGIN 4 // small gap from edge, adjust as needed
 
+// Snowflake warning: drawn near outside temp when <= 0°C (ice risk)
+static void drawSnowflakeWarning(int16_t cx, int16_t cy)
+{
+	// 3 lines through center (horizontal, vertical, diagonal)
+	const int r = 4;
+	display.drawFastHLine(cx - r, cy, 2 * r + 1, SSD1306_WHITE);
+	display.drawFastVLine(cx, cy - r, 2 * r + 1, SSD1306_WHITE);
+	display.drawLine(cx - r + 1, cy - r + 1, cx + r - 1, cy + r - 1, SSD1306_WHITE);
+	display.drawLine(cx + r - 1, cy - r + 1, cx - r + 1, cy + r - 1, SSD1306_WHITE);
+	// center dot
+	display.drawPixel(cx, cy, SSD1306_WHITE);
+}
+
+static void drawBatteryTopRight()
+{
+	float batt = battVoltageCached;
+	if (isnan(batt))
+		return;
+	bool lowBatt = (batt < BATT_LOW_V);
+	if (lowBatt && ((millis() / 400) % 2) == 0)
+		return; // blink off every other 400ms interval
+	display.setFont();
+	display.setTextSize(1);
+	char buf[8];
+	snprintf(buf, sizeof(buf), "%.1fV", batt);
+	int16_t x1, y1;
+	uint16_t w, h;
+	display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+	display.setCursor(SCREEN_WIDTH - (int16_t)w - SIDE_MARGIN, 2);
+	display.print(buf);
+}
+
 void drawOilPage(float oilC)
 {
 	display.clearDisplay();
@@ -1113,14 +1171,15 @@ void drawOilPage(float oilC)
 		display.setCursor(SIDE_MARGIN, 2);
 		display.print(outsideTemp, 1);
 		display.print("C");
+		// ice warning: snowflake when at or below 0°C
+		if (outsideTemp <= 0.0f)
+			drawSnowflakeWarning(SIDE_MARGIN + 34, 5);
 	}
 	else
 	{
 		display.setCursor(SIDE_MARGIN, 2);
 		display.print("--");
 	}
-
-	drawCenteredTitleTiny("Oil", 8);
 
 	int16_t baselineY = 45;
 	if (isnan(oilC))
@@ -1142,33 +1201,17 @@ void drawOilPage(float oilC)
 	display.setFont();
 	display.setTextSize(1);
 
-	// status text next to value
+	// status text: COLD below range, HOT above 95°C, nothing in OK range
 	if (!isnan(oilC))
 	{
 		display.setCursor(2, 46);
-		if (oilC >= OIL_GOOD_MIN && oilC <= OIL_GOOD_MAX)
-			display.print("OK");
-		else if (oilC > OIL_GOOD_MAX)
-			display.print("HOT");
-		else
+		if (oilC < 60.0f)
 			display.print("COLD");
+		else if (oilC > 95.0f)
+			display.print("HOT");
 	}
 
-	// battery voltage in corner with same fixed margin from right edge
-	float batt = battVoltageCached;
-	if (!isnan(batt))
-	{
-		display.setFont();
-		display.setTextSize(1);
-		String bs = String(batt, 1);
-		bs += "V";
-		int16_t x1, y1;
-		uint16_t w, h;
-		display.getTextBounds(bs.c_str(), 0, 0, &x1, &y1, &w, &h);
-		int battX = SCREEN_WIDTH - w - SIDE_MARGIN;
-		display.setCursor(battX, 0);
-		display.print(bs);
-	}
+	drawBatteryTopRight();
 
 	drawOilBar(oilC);
 	drawBlitzerWarnerAliveIndicator();
@@ -1634,7 +1677,7 @@ void bootProgressInitAndMaybeCalibrate()
 	{
 		float t = dsSensors.getTempC(outsideSensorAddr);
 		if (t != DEVICE_DISCONNECTED_C && t > -50.0f && t < 85.0f)
-			outsideTemp = t;
+			outsideTemp = t + DS18B20_OFFSET;
 		outsideConvRequested = false;
 		lastOutsideMs = millis();
 	}
@@ -1864,6 +1907,18 @@ void loop()
 
 		// Blitzer-Warner heartbeat is sampled in updateAdsReadings() via AIN1
 
+		// --- Test mode overrides ---
+		#ifdef TEST_MODE
+		{
+			oilTempCached    = triangleWave(-5.0f,  120.0f, 30000UL);
+			battVoltageCached = triangleWave(0.0f,   15.0f,  12000UL);
+			outsideTemp      = triangleWave(-10.0f,  40.0f,  14000UL);
+			float simLean = triangleWave(-90.0f, 90.0f, 8000UL);
+			rollUi        = simLean;
+			rollFiltered  = simLean;
+		}
+		#endif
+
 		// blitzer overlay takes over entire display
 		if (millis() < blitzerActiveUntilMs)
 		{
@@ -1876,6 +1931,30 @@ void loop()
 			display.setCursor(4, 44);
 			display.print("BLITZ!");
 			display.setFont();
+			display.setTextColor(SSD1306_WHITE);
+			display.display();
+		}
+		else if (!isnan(oilTempCached) && oilTempCached >= OIL_CRITICAL_C)
+		{
+			bool flashOn = ((millis() / 300) % 2) == 0;
+			display.clearDisplay();
+			if (flashOn)
+				display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
+			display.setTextColor(flashOn ? SSD1306_BLACK : SSD1306_WHITE);
+			display.setFont(&FreeSansBold18pt7b);
+			{
+				const char* hotTxt = "HOT";
+				int16_t tx1, ty1; uint16_t tw, th;
+				display.getTextBounds(hotTxt, 0, 0, &tx1, &ty1, &tw, &th);
+				display.setCursor((SCREEN_WIDTH - (int16_t)tw) / 2 - tx1, 46);
+				display.print(hotTxt);
+			}
+			display.setFont();
+			display.setTextSize(1);
+			char tbuf[8];
+			snprintf(tbuf, sizeof(tbuf), "%.0fC", oilTempCached);
+			display.setCursor(90, 0);
+			display.print(tbuf);
 			display.setTextColor(SSD1306_WHITE);
 			display.display();
 		}
