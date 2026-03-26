@@ -125,9 +125,12 @@ Adafruit_ADS1115 ads; // default I2C address 0x48
 #define DIVIDER_VCC 3.3f      // actual supply voltage of the NTC voltage divider
 
 // battery divider resistors (adjust to your hardware)
-// 27k/10k: max measurable = 4.096V * (27k+10k)/10k = 15.15V → safe for 12V motorcycle system
-const float BATT_R_TOP = 27000.0f; // 27 kΩ between battery+ and A2
+// 33k/10k: max measurable = 4.096V * (33k+10k)/10k = 17.6V → safe for 12V motorcycle system
+const float BATT_R_TOP = 33000.0f; // 33 kΩ between battery+ and A2
 const float BATT_R_BOT = 10000.0f; // 10 kΩ between A2 and GND
+// calibration: measured_real / measured_displayed (set 1.0 to disable)
+// e.g. multimeter shows 12.1V, display shows 12.0V → 12.1/12.0 = 1.00833
+const float BATT_CAL = 1.00833f;
 
 // ---------------- one‑wire / outside temp ----------------
 #define ONE_WIRE_PIN 7  // GPIO7 - safe on ESP32-S3 N16R8 (GPIO35-37 = PSRAM, avoid)
@@ -647,8 +650,8 @@ float readBatteryVoltage()
 	float v = readAdsVoltage(ADS_CH_BATT);
 	if (isnan(v))
 		return NAN;
-	// correct divider
-	return v * (BATT_R_TOP + BATT_R_BOT) / BATT_R_BOT;
+	// correct divider + calibration
+	return v * (BATT_R_TOP + BATT_R_BOT) / BATT_R_BOT * BATT_CAL;
 }
 
 // updateAdsReadings: one ADS1115 read per call, rotating through 3 channels
