@@ -329,8 +329,11 @@ const float CENTER_OPPOSITE_CANCEL = 5.0f;   // opposite-side degrees to cancel 
 
 // ---------------- G-Force ----------------
 const float G0 = 9.80665f;
-float gX = 0.0f, gY = 0.0f;
-const float G_ALPHA = 0.25f;
+float gX = 0.0f, gY = 0.0f;           // slow-filtered (display dot)
+float gXFast = 0.0f, gYFast = 0.0f;   // fast-filtered (max-G tracking)
+const float G_ALPHA_DISPLAY = 0.10f;   // träge → wenig Jitter auf dem Dot
+const float G_ALPHA_MAX     = 0.20f;   // schneller → echte Manöver landen im Max
+const float G_DEADZONE      = 0.04f;   // Motorvibrationen < 0.04g werden ignoriert
 
 float maxGSaved = 0.0f;
 
@@ -931,10 +934,19 @@ void updateGForce()
 	float gxNow = bno085LinX / G0;
 	float gyNow = bno085LinY / G0;
 
-	gX += G_ALPHA * (gxNow - gX);
-	gY += G_ALPHA * (gyNow - gY);
+	// Deadzone: Motorvibrationen unter Schwellwert auf Null setzen
+	if (fabsf(gxNow) < G_DEADZONE) gxNow = 0.0f;
+	if (fabsf(gyNow) < G_DEADZONE) gyNow = 0.0f;
 
-	float mag = sqrtf(gX * gX + gY * gY);
+	// Langsamer Filter für den Anzeigedot — weniger Vibrations-Jitter
+	gX += G_ALPHA_DISPLAY * (gxNow - gX);
+	gY += G_ALPHA_DISPLAY * (gyNow - gY);
+
+	// Schnellerer Filter für Max-G-Tracking — echte Manöver gehen nicht verloren
+	gXFast += G_ALPHA_MAX * (gxNow - gXFast);
+	gYFast += G_ALPHA_MAX * (gyNow - gYFast);
+
+	float mag = sqrtf(gXFast * gXFast + gYFast * gYFast);
 	if (mag > maxGSaved)
 	{
 		maxGSaved = mag;
@@ -1402,8 +1414,8 @@ void drawLeanPage()
 void drawGCircle(float gx, float gy, float maxGVal)
 {
 	const int16_t cx = 64;
-	const int16_t cy = 40;
-	const int16_t r = 20;
+	const int16_t cy = 32;
+	const int16_t r = 26;
 
 	const float rangeG = 1.5f; // +/- 1.5g
 
@@ -1424,7 +1436,7 @@ void drawGCircle(float gx, float gy, float maxGVal)
 	display.setTextSize(1);
 
 	float mag = sqrtf(gx * gx + gy * gy);
-	display.setCursor(1, 10);
+	display.setCursor(1, 0);
 	display.print(mag, 2);
 	display.print("g");
 
@@ -1438,8 +1450,6 @@ void drawGPage()
 {
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
-
-	drawCenteredTitleTiny("G-Force", 8);
 
 	drawGCircle(gX, gY, maxGSaved);
 
