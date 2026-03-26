@@ -599,7 +599,7 @@ void buttonUpdate()
 		{
 			if (btn.pressed && !btn.longFired)
 			{
-				page = (Page)((page + 1) % 4);
+				page = (Page)((page + 1) % (PAGE_RACEBOX + 1));
 				resetAnimUntilMs = 0;
 			}
 			raceboxBtnArmed = true; // re-arm after button fully released
@@ -948,7 +948,7 @@ void updateNightMode()
 		return;
 
 	float lux = lightMeter.readLightLevel();
-	if (isnan(lux) || lux < 0)
+	if (isnan(lux) || lux < 0 || lux >= 65535.0f)
 		return;
 
 	const float LUX_ALPHA = 0.12f;
