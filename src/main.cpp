@@ -861,7 +861,7 @@ void updateOutsideTemp()
 		outsideConvRequested = false;
 		float t = dsSensors.getTempC(outsideSensorAddr);
 		if (t != DEVICE_DISCONNECTED_C && t > -50.0f && t < 85.0f)
-			outsideTemp = t + DS18B20_OFFSET;
+			outsideTemp = roundf((t + DS18B20_OFFSET) * 2.0f) / 2.0f;
 		lastOutsideMs = now;
 		return;
 	}
@@ -2165,7 +2165,7 @@ void bootProgressInitAndMaybeCalibrate()
 	{
 		float t = dsSensors.getTempC(outsideSensorAddr);
 		if (t != DEVICE_DISCONNECTED_C && t > -50.0f && t < 85.0f)
-			outsideTemp = t + DS18B20_OFFSET;
+			outsideTemp = roundf((t + DS18B20_OFFSET) * 2.0f) / 2.0f;
 		outsideConvRequested = false;
 		lastOutsideMs = millis();
 	}
