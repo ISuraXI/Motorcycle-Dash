@@ -131,7 +131,7 @@ const float BATT_R_BOT = 10000.0f; // 10 kΩ between A2 and GND
 // calibration: measured_real / measured_displayed (set 1.0 to disable)
 // e.g. multimeter shows 12.1V, display shows 12.0V → 12.1/12.0 = 1.00833
 const float BATT_CAL = 1.00833f;
-const float BATT_LOW_V = 10.5f;    // battery low warning threshold (flash text)
+float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text) – runtime, saved in EEPROM
 
 // ---- Test mode: comment out to disable ----
 // #define TEST_MODE
@@ -154,8 +154,8 @@ bool ds18b20Found = false;          // sensor discovered?
 float oilTempCached = NAN;
 const float OIL_EMA_ALPHA = 0.15f;  // smoothing factor for oil temp
 
-// DS18B20 calibration offset (add to raw reading)
-const float DS18B20_OFFSET = -1.2f;
+// DS18B20 calibration offset (add to raw reading) – runtime, saved in EEPROM
+float DS18B20_OFFSET = -1.2f;
 
 // battery voltage cache
 float battVoltageCached = NAN;
@@ -274,6 +274,33 @@ struct ButtonState
 
 unsigned long resetAnimUntilMs = 0;
 
+// ---------------- Settings ----------------
+#define SETTINGS_OPEN_MS   5000   // hold duration to enter settings
+#define SETTINGS_TIMEOUT_MS 10000 // auto-close after 10s inactivity
+#define SETTINGS_LONGPRESS_MS 600 // long press inside settings = change value
+
+// Items
+enum SettingsItem : uint8_t {
+	SET_DS18_OFFSET = 0,  // outside temp offset
+	SET_G_DEAD,           // G-force deadzone
+	SET_BRIGHTNESS,       // brightness mode: 0=Auto, 1=Tag, 2=Nacht
+	SET_LEAN_FLIP,        // invert lean angle direction
+	SET_RESET_ALL,        // reset all max values
+	SET_COUNT
+};
+
+// Brightness mode: 0=Auto (BH1750), 1=Tag (always max), 2=Nacht (always min)
+uint8_t brightMode = 0;
+bool leanFlip = false;  // true = invert roll direction (sensor mounted mirrored)
+
+bool settingsOpen = false;
+uint8_t settingsIdx = 0;           // currently selected item
+unsigned long settingsLastActMs = 0; // last interaction time (for timeout)
+bool settingsLongFired = false;    // long-press-in-settings already fired
+unsigned long settingsPressStartMs = 0;
+
+void drawSettingsPage();
+
 // ---------------- Oil temp ----------------
 // NOTE: OIL_PIN is a legacy fallback – oil temp is read via ADS1115 ch0.
 // GPIO35-37 are used for PSRAM on ESP32-S3 N16R8; remaped to GPIO1 (unused).
@@ -333,7 +360,7 @@ float gX = 0.0f, gY = 0.0f;           // slow-filtered (display dot)
 float gXFast = 0.0f, gYFast = 0.0f;   // fast-filtered (max-G tracking)
 const float G_ALPHA_DISPLAY = 0.10f;   // träge → wenig Jitter auf dem Dot
 const float G_ALPHA_MAX     = 0.20f;   // schneller → echte Manöver landen im Max
-const float G_DEADZONE      = 0.04f;   // Motorvibrationen < 0.04g werden ignoriert
+float G_DEADZONE            = 0.04f;   // Motorvibrationen < 0.04g werden ignoriert – runtime, saved in EEPROM
 
 float maxGSaved = 0.0f;
 
@@ -353,13 +380,21 @@ static uint8_t gQuadrant(float gx, float gy)
 }
 
 // ---------------- EEPROM ----------------
-#define EEPROM_SIZE 16
+#define EEPROM_SIZE 32
 #define EE_MAGIC 0x42
 #define EE_MAGIC_ADDR 0
-#define EE_MAXLEAN_ADDR   1 // uint16_t deg (combined abs max, kept for compat)
-#define EE_MAXG_ADDR      3 // uint16_t centi-g
-#define EE_MAXLEAN_L_ADDR 5 // uint16_t deg – max left lean
-#define EE_MAXLEAN_R_ADDR 7 // uint16_t deg – max right lean
+#define EE_MAXLEAN_ADDR    1 // uint16_t deg (combined abs max, kept for compat)
+#define EE_MAXG_ADDR       3 // uint16_t centi-g
+#define EE_MAXLEAN_L_ADDR  5 // uint16_t deg – max left lean
+#define EE_MAXLEAN_R_ADDR  7 // uint16_t deg – max right lean
+// Settings (stored as signed int8 or uint8)
+#define EE_SET_MAGIC     9  // uint8_t magic to detect first-ever settings save
+#define EE_SET_MAGIC_VAL 0x5E
+#define EE_SET_DS18_OFF  10  // int8_t  tenths of °C  (-30..+30 → -3.0..+3.0°C)
+#define EE_SET_BATT_LOW  11  // uint8_t tenths of V   (80..140  → 8.0..14.0V)
+#define EE_SET_G_DEAD    12  // uint8_t hundredths g  (0..20    → 0..0.20g)
+#define EE_SET_BRIGHT    14  // uint8_t 0=Auto 1=Tag 2=Nacht
+#define EE_SET_LEAN_FLIP 13  // uint8_t 0/1
 
 bool maxDirty = false;
 unsigned long lastEESaveMs = 0;
@@ -524,6 +559,20 @@ bool loadMaxValues()
 		vG |= (uint16_t)EEPROM.read(EE_MAXG_ADDR);
 		vG |= (uint16_t)EEPROM.read(EE_MAXG_ADDR + 1) << 8;
 		maxGSaved = ((float)vG) / 100.0f;
+
+		// Settings – only load if their own magic byte is present
+		if (EEPROM.read(EE_SET_MAGIC) == EE_SET_MAGIC_VAL)
+		{
+			int8_t  eeDs18  = (int8_t) EEPROM.read(EE_SET_DS18_OFF);
+			uint8_t eeGDead = EEPROM.read(EE_SET_G_DEAD);
+			uint8_t eeFlip   = EEPROM.read(EE_SET_LEAN_FLIP);
+			uint8_t eeBright = EEPROM.read(EE_SET_BRIGHT);
+			DS18B20_OFFSET = clampf((float)eeDs18  / 10.0f, -3.0f,  3.0f);
+			G_DEADZONE     = clampf((float)eeGDead / 100.0f, 0.0f,  0.20f);
+			brightMode     = (eeBright <= 2) ? eeBright : 0;
+			leanFlip       = (eeFlip == 1);
+		}
+		// else: keep compile-time defaults (DS18B20_OFFSET=-1.2, BATT_LOW_V=10.5, G_DEADZONE=0.04)
 	}
 	else
 	{
@@ -574,6 +623,13 @@ void saveMaxValuesNow()
 	EEPROM.write(EE_MAXLEAN_R_ADDR,     (uint8_t)(vLR & 0xFF));
 	EEPROM.write(EE_MAXLEAN_R_ADDR + 1, (uint8_t)((vLR >> 8) & 0xFF));
 
+	// Settings
+	EEPROM.write(EE_SET_MAGIC,     EE_SET_MAGIC_VAL);
+	EEPROM.write(EE_SET_DS18_OFF,  (uint8_t)(int8_t)lroundf(DS18B20_OFFSET * 10.0f));
+	EEPROM.write(EE_SET_G_DEAD,    (uint8_t)lroundf(G_DEADZONE * 100.0f));
+	EEPROM.write(EE_SET_BRIGHT,    brightMode);
+	EEPROM.write(EE_SET_LEAN_FLIP, leanFlip ? 1 : 0);
+
 	EEPROM.commit();
 }
 
@@ -612,48 +668,141 @@ void buttonUpdate()
 			btn.pressed = true;
 			btn.pressStartMs = now;
 			btn.longFired = false;
+			settingsLongFired = false;
+			settingsPressStartMs = now;
 		}
 		else
 		{
-			if (btn.pressed && !btn.longFired)
+			// ---- button released ----
+			if (settingsOpen)
 			{
-				page = (Page)((page + 1) % (PAGE_RACEBOX + 1));
-				resetAnimUntilMs = 0;
+				if (btn.pressed && !settingsLongFired)
+				{
+					// short press in settings → next item
+					settingsIdx = (settingsIdx + 1) % SET_COUNT;
+					settingsLastActMs = now;
+				}
 			}
-			raceboxBtnArmed = true; // re-arm after button fully released
+			else
+			{
+				if (btn.pressed && !btn.longFired)
+				{
+					page = (Page)((page + 1) % (PAGE_RACEBOX + 1));
+					resetAnimUntilMs = 0;
+				}
+				raceboxBtnArmed = true; // re-arm after button fully released
+			}
 			btn.pressed = false;
 		}
 	}
 
-	// long press (reset)
+	// ---- settings: 10s inactivity timeout ----
+	if (settingsOpen && (now - settingsLastActMs) >= SETTINGS_TIMEOUT_MS)
+	{
+		settingsOpen = false;
+		saveMaxValuesNow(); // persist settings
+	}
+
+	// ---- long press handling ----
 	if (btn.pressed && !btn.longFired)
 	{
-		const unsigned long threshold = (page == PAGE_RACEBOX) ? RACEBOX_LONGPRESS_MS : LONGPRESS_MS;
-		if ((now - btn.pressStartMs) >= threshold)
+		if (settingsOpen)
 		{
-			btn.longFired = true;
+			// long press inside settings → change value
+			if (!settingsLongFired && (now - settingsPressStartMs) >= SETTINGS_LONGPRESS_MS)
+			{
+				settingsLongFired = true;
+				btn.longFired = true;
+				settingsLastActMs = now;
 
-			if (page == PAGE_LEAN)
-			{
-				maxLeanSaved = 0.0f;
-				maxLeanLeft  = 0.0f;
-				maxLeanRight = 0.0f;
-				maxDirty = true;
-				resetAnimUntilMs = now + 350;
+				switch (settingsIdx)
+				{
+					case SET_DS18_OFFSET:
+					DS18B20_OFFSET += 0.5f;
+						if (DS18B20_OFFSET > 3.0f) DS18B20_OFFSET = -3.0f;
+						break;
+				case SET_G_DEAD:
+					{
+						// fixed presets: 0.00 → 0.02 → 0.04 → 0.06 → 0.10 → 0.15 → 0.20 → 0.00 ...
+						static const float kGDeadPresets[] = { 0.00f, 0.02f, 0.04f, 0.06f, 0.10f, 0.15f, 0.20f };
+						static const uint8_t kGDeadN = sizeof(kGDeadPresets) / sizeof(kGDeadPresets[0]);
+						// find current index (nearest match)
+						uint8_t idx = 0;
+						float best = fabsf(G_DEADZONE - kGDeadPresets[0]);
+						for (uint8_t p = 1; p < kGDeadN; p++) {
+							float d = fabsf(G_DEADZONE - kGDeadPresets[p]);
+							if (d < best) { best = d; idx = p; }
+						}
+						idx = (idx + 1) % kGDeadN;
+						G_DEADZONE = kGDeadPresets[idx];
+					}
+						break;
+					case SET_BRIGHTNESS:
+						brightMode = (brightMode + 1) % 3;
+						// apply immediately
+						if (brightMode == 1) oledSetContrast(CONTRAST_DAY);
+						else if (brightMode == 2) oledSetContrast(CONTRAST_NIGHT);
+						break;
+					case SET_LEAN_FLIP:
+					leanFlip = !leanFlip;
+					break;
+					case SET_RESET_ALL:
+						maxLeanSaved = 0.0f;
+						maxLeanLeft  = 0.0f;
+						maxLeanRight = 0.0f;
+						maxGSaved    = 0.0f;
+						memset(gQuadPeaks,   0, sizeof(gQuadPeaks));
+						memset(gQuadHasSlot, 0, sizeof(gQuadHasSlot));
+						maxDirty = true;
+						break;
+					default: break;
+				}
 			}
-			else if (page == PAGE_G)
+		}
+		else
+		{
+			// ---- normal long press ----
+			// 5s on the oil page → open settings
+			if (page == PAGE_OIL)
 			{
-				maxGSaved = 0.0f;
-				memset(gQuadPeaks,   0, sizeof(gQuadPeaks));
-				memset(gQuadHasSlot, 0, sizeof(gQuadHasSlot));
-				maxDirty = true;
-				resetAnimUntilMs = now + 350;
+				if (!btn.longFired && (now - btn.pressStartMs) >= SETTINGS_OPEN_MS)
+				{
+					btn.longFired = true;
+					settingsOpen  = true;
+					settingsIdx   = 0;
+					settingsLastActMs = now;
+					settingsLongFired = false;
+				}
+				return; // on oil page, no other long-press action exists
 			}
-			else if (page == PAGE_RACEBOX && raceboxBtnArmed)
+
+			const unsigned long threshold = (page == PAGE_RACEBOX) ? RACEBOX_LONGPRESS_MS : LONGPRESS_MS;
+			if ((now - btn.pressStartMs) >= threshold)
 			{
-				digitalWrite(RACEBOX_BTN_PIN, HIGH); // transistor on = button pressed
-				raceboxBtnUntilMs = now + 1000;
-				raceboxBtnArmed = false;
+				btn.longFired = true;
+
+				if (page == PAGE_LEAN)
+				{
+					maxLeanSaved = 0.0f;
+					maxLeanLeft  = 0.0f;
+					maxLeanRight = 0.0f;
+					maxDirty = true;
+					resetAnimUntilMs = now + 350;
+				}
+				else if (page == PAGE_G)
+				{
+					maxGSaved = 0.0f;
+					memset(gQuadPeaks,   0, sizeof(gQuadPeaks));
+					memset(gQuadHasSlot, 0, sizeof(gQuadHasSlot));
+					maxDirty = true;
+					resetAnimUntilMs = now + 350;
+				}
+				else if (page == PAGE_RACEBOX && raceboxBtnArmed)
+				{
+					digitalWrite(RACEBOX_BTN_PIN, HIGH);
+					raceboxBtnUntilMs = now + 1000;
+					raceboxBtnArmed = false;
+				}
 			}
 		}
 	}
@@ -904,7 +1053,7 @@ void updateLean()
 		return;
 
 	pollBno085();
-	float roll = normalizeAngleDeg(bno085Roll - rollOffsetDeg);
+	float roll = normalizeAngleDeg(bno085Roll - rollOffsetDeg) * (leanFlip ? -1.0f : 1.0f);
 
 	static bool initDone = false;
 	if (!initDone)
@@ -993,6 +1142,21 @@ void updateGForce()
 
 void updateNightMode()
 {
+	// Manual override: Tag or Nacht fixed, no sensor needed
+	if (brightMode == 1)
+	{
+		contrastF = (float)CONTRAST_DAY;
+		oledSetContrast(CONTRAST_DAY);
+		return;
+	}
+	if (brightMode == 2)
+	{
+		contrastF = (float)CONTRAST_NIGHT;
+		oledSetContrast(CONTRAST_NIGHT);
+		return;
+	}
+
+	// Auto mode: use BH1750
 	if (!bhOk)
 		return;
 
@@ -1367,6 +1531,17 @@ void drawOilPage(float oilC)
 
 	drawOilBar(oilC);
 	drawBlitzerWarnerAliveIndicator();
+
+	// hold-progress bar: grows left→right while button held, shows 5s entry progress
+	if (btn.pressed)
+	{
+		unsigned long held = millis() - btn.pressStartMs;
+		int barW = (int)((float)held / (float)SETTINGS_OPEN_MS * 126.0f);
+		if (barW > 126) barW = 126;
+		if (barW > 0)
+			display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
+	}
+
 	display.display();
 }
 
@@ -1664,6 +1839,98 @@ void drawRaceBoxPage()
 	display.display();
 }
 
+// =========================================================
+// Settings UI helpers
+// =========================================================
+void drawSettingsPage()
+{
+	display.clearDisplay();
+	display.setTextColor(SSD1306_WHITE);
+	display.setFont();
+	display.setTextSize(1);
+
+	// Title bar
+	display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+	display.setTextColor(SSD1306_BLACK);
+	display.setCursor(3, 2);
+	display.print("EINSTELLUNGEN");
+	display.setTextColor(SSD1306_WHITE);
+
+	// Items – 5 rows of 10px each starting at y=13
+	const char* labels[SET_COUNT] = {
+		"AuTemp Offset",
+		"G-Deadzone",
+		"Helligkeit",
+		"Lean flip",
+		"Alles loeschen"
+	};
+
+	char valBuf[14];
+	for (uint8_t i = 0; i < SET_COUNT; i++)
+	{
+		int16_t y = 13 + i * 10;
+
+		if (i == settingsIdx)
+			display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE);
+
+		display.setTextColor(i == settingsIdx ? SSD1306_BLACK : SSD1306_WHITE);
+		display.setCursor(2, y);
+		display.print(labels[i]);
+
+		switch (i)
+		{
+			case SET_DS18_OFFSET:
+				snprintf(valBuf, sizeof(valBuf), "%+.1fC", DS18B20_OFFSET);
+				break;
+			case SET_G_DEAD:
+				snprintf(valBuf, sizeof(valBuf), "%.2fg", G_DEADZONE);
+				break;
+			case SET_BRIGHTNESS:
+			{
+				const char* bNames[] = { "Auto", "Tag", "Nacht" };
+				snprintf(valBuf, sizeof(valBuf), "%s", bNames[brightMode]);
+				break;
+			}
+			case SET_LEAN_FLIP:
+				snprintf(valBuf, sizeof(valBuf), "%s", leanFlip ? "AN" : "AUS");
+				break;
+			case SET_RESET_ALL:
+				snprintf(valBuf, sizeof(valBuf), "HOLD");
+				break;
+			default:
+				valBuf[0] = 0;
+				break;
+		}
+
+		int16_t vx = 128 - (int16_t)(strlen(valBuf) * 6) - 2;
+		display.setCursor(vx, y);
+		display.print(valBuf);
+	}
+	display.setTextColor(SSD1306_WHITE);
+
+	// hold-progress bar at bottom while pressing
+	unsigned long now = millis();
+	if (btn.pressed)
+	{
+		unsigned long held = now - settingsPressStartMs;
+		int barW = (int)((float)held / (float)SETTINGS_LONGPRESS_MS * 128.0f);
+		if (barW > 128) barW = 128;
+		if (barW > 0)
+			display.fillRect(0, 63, barW, 1, SSD1306_WHITE);
+	}
+
+	// timeout countdown bar (bottom line shrinks as timeout approaches)
+	{
+		unsigned long elapsed = now - settingsLastActMs;
+		int barW = 128 - (int)((float)elapsed / (float)SETTINGS_TIMEOUT_MS * 128.0f);
+		if (barW < 0) barW = 0;
+		display.drawFastHLine(128 - barW, 63, barW, SSD1306_WHITE);
+	}
+
+	display.display();
+}
+
+// =========================================================
 void calibrateRollOffset()
 {
 	display.clearDisplay();
@@ -2140,8 +2407,13 @@ void loop()
 		}
 		#endif
 
+		// settings overlay takes priority over everything except blitzer
+		if (settingsOpen)
+		{
+			drawSettingsPage();
+		}
 		// blitzer overlay takes over entire display
-		if (millis() < blitzerActiveUntilMs)
+		else if (millis() < blitzerActiveUntilMs)
 		{
 			bool flashOn = ((millis() / 200) % 2) == 0;
 			display.clearDisplay();
