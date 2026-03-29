@@ -122,7 +122,7 @@ Adafruit_ADS1115 ads; // default I2C address 0x48
 #define ADS_GAIN GAIN_ONE
 #define ADS_VREF 4.096f       // ADS1115 internal reference for GAIN_ONE (for ADC scaling)
 #define ADS_SCALE (ADS_VREF / 32768.0f)
-#define DIVIDER_VCC 3.3f      // actual supply voltage of the NTC voltage divider
+#define DIVIDER_VCC 3.3f      // actual supply voltage of the NTC voltage divider (10k to 3.3V)
 
 // battery divider resistors (adjust to your hardware)
 // 33k/10k: max measurable = 4.096V * (33k+10k)/10k = 17.6V → safe for 12V motorcycle system
@@ -152,7 +152,8 @@ bool ds18b20Found = false;          // sensor discovered?
 
 // oil temperature cache
 float oilTempCached = NAN;
-const float OIL_EMA_ALPHA = 0.15f;  // smoothing factor for oil temp
+const float OIL_EMA_ALPHA = 0.05f;  // smoothing factor for oil temp
+float dbgOilVoltage = NAN;  // last raw ADS voltage (debug)
 
 // DS18B20 calibration offset (add to raw reading) – runtime, saved in EEPROM
 float DS18B20_OFFSET = -1.2f;
@@ -451,7 +452,7 @@ void showReadyScreen();
 // Progressive boot
 void drawCalIconTopRight(bool bnoOK, bool armed);
 static void drawSelfTestLineProgress(int y, const char *label, int8_t st);
-static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, int8_t stAds, bool calArmed, float prog01);
+static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stAds, int8_t stEe, bool calArmed, float prog01);
 void bootProgressInitAndMaybeCalibrate();
 
 // =========================================================
@@ -824,18 +825,19 @@ float readAdsVoltage(int ch)
 float readOilTempOnce()
 {
 	float v = readAdsVoltage(ADS_CH_OIL);
+	dbgOilVoltage = v;  // store for debug display
 	if (isnan(v))
 		return NAN;
 	if (v <= 0.001f)
 		return NAN;
-	if (v >= (DIVIDER_VCC - 0.001f))
+	if (v >= (DIVIDER_VCC - 0.1f))  // within 100mV of VCC = no sensor connected
 		return NAN;
 
+	// 10kΩ at top (5V→10kΩ→AIN0), NTC at bottom (AIN0→NTC→GND)
+	// v = VCC * R_NTC / (R_NTC + R_REF)  →  R_NTC = R_REF * v / (VCC - v)
 	float rNtc = R_REF * v / (DIVIDER_VCC - v);
 	float tempK = 1.0f / ((1.0f / (T0C + 273.15f)) + (1.0f / BETA) * logf(rNtc / R0));
 	float tempC = tempK - 273.15f;
-	if (tempC < -20.0f || tempC > 160.0f)
-		return NAN;
 	return tempC;
 }
 
@@ -878,13 +880,22 @@ void updateOutsideTemp()
 // updateOilTemp: single-read EMA, called from updateAdsReadings
 void updateOilTemp()
 {
+	static unsigned long firstNanMs = 0;
 	float t = readOilTempOnce();
 	if (isnan(t))
+	{
+		// clear cache after 3s of consecutive NAN readings → shows "--" again
+		if (firstNanMs == 0) firstNanMs = millis();
+		if (millis() - firstNanMs > 3000) oilTempCached = NAN;
 		return;
+	}
+	firstNanMs = 0;  // reset timer on valid reading
 	if (isnan(oilTempCached))
 		oilTempCached = t;  // first valid reading
 	else
 		oilTempCached += OIL_EMA_ALPHA * (t - oilTempCached);
+	// round to 0.5°C steps to avoid flickering
+	oilTempCached = roundf(oilTempCached * 2.0f) / 2.0f;
 }
 
 float readBatteryVoltage()
@@ -1508,10 +1519,30 @@ void drawOilPage(float oilC)
 		int16_t x = (display.width() - (int16_t)w) / 2;
 		display.setCursor(x, baselineY);
 		display.print(s);
+		// debug: show reason below title, above bar
+		display.setFont();
+		display.setTextSize(1);
+		display.setCursor(0, 20);
+		if (!adsOk)
+			display.print("ADS:FAIL");
+		else if (isnan(dbgOilVoltage))
+			display.print("V:NaN");
+		else
+		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
 	}
 	else
 	{
 		drawCenteredBigNumberWithDegree((int)round(oilC), baselineY);
+		// debug voltage always visible
+		display.setFont();
+		display.setTextSize(1);
+		display.setCursor(0, 20);
+		if (!adsOk)
+			display.print("ADS:FAIL");
+		else if (isnan(dbgOilVoltage))
+			display.print("V:NaN");
+		else
+		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
 	}
 
 	display.setFont();
@@ -2048,7 +2079,7 @@ static void drawSelfTestLineProgress(int y, const char *label, int8_t st)
 	}
 }
 
-static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, int8_t stAds, bool calArmed, float prog01)
+static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stAds, int8_t stEe, bool calArmed, float prog01)
 {
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
@@ -2076,20 +2107,20 @@ static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stEe, int8_t st
 
 void bootProgressInitAndMaybeCalibrate()
 {
-	int8_t stBno = -1, stBh = -1, stEe = -1, stAds = -1;
+	int8_t stBno = -1, stBh = -1, stAds = -1, stEe = -1;
 
 	// show instantly
-	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.0f);
+	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.0f);
 
 	// EEPROM
 	eepromOk = loadMaxValues();
 	stEe = eepromOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.15f);
+	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.15f);
 
 	// BH1750
 	bhOk = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
 	stBh = bhOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.3f);
+	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.3f);
 
 	// ADS1115
 	adsOk = ads.begin();
@@ -2104,7 +2135,7 @@ void bootProgressInitAndMaybeCalibrate()
 			else delay(20);
 		}
 	}
-	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.45f);
+	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.45f);
 
 	// BNO085
 	bnoOk = bno.begin_I2C();
@@ -2117,7 +2148,7 @@ void bootProgressInitAndMaybeCalibrate()
 	}
 	rollOffsetDeg = -3.00f;  // hardcoded mount offset (measured)
 	stBno = bnoOk ? 1 : 0;
-	renderBootProgress(stBno, stBh, stEe, stAds, false, 0.6f);
+	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.6f);
 
 	// kick off DS18B20 conversion now — will be ready after 2s wait
 	if (ds18b20Found)
@@ -2150,7 +2181,7 @@ void bootProgressInitAndMaybeCalibrate()
 		}
 
 		updateAdsReadings();  // keep pumping ADS during splash so oil temp is ready
-		renderBootProgress(stBno, stBh, stEe, stAds, calArmed, prog);
+		renderBootProgress(stBno, stBh, stAds, stEe, calArmed, prog);
 		delay(25);
 		yield();
 	}
@@ -2398,7 +2429,7 @@ void loop()
 		// --- Test mode overrides ---
 		#ifdef TEST_MODE
 		{
-			oilTempCached    = triangleWave(-5.0f,  120.0f, 30000UL);
+			oilTempCached    = triangleWave(-30.0f, 120.0f, 30000UL);
 			battVoltageCached = triangleWave(0.0f,   15.0f,  12000UL);
 			outsideTemp      = triangleWave(-10.0f,  40.0f,  14000UL);
 			float simLean = triangleWave(-90.0f, 90.0f, 8000UL);
