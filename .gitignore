@@ -5,5 +5,4 @@
 *.hex
 *.o
 *.log
-/lib
-/test
+.DS_Store
