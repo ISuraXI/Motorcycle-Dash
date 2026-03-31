@@ -135,4 +135,8 @@ board_build.arduino.memory_type = qio_opi
 
 ## License
 
-MIT
+This project is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+
+You may use, modify, and share this project for non-commercial purposes only.
+
+Commercial use is not allowed without explicit permission.
