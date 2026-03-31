@@ -891,7 +891,17 @@ void updateOilTemp()
 	}
 	firstNanMs = 0;  // reset timer on valid reading
 	if (isnan(oilTempCached))
-		oilTempCached = t;  // first valid reading
+	{
+		// warm-up: average 8 quick samples to avoid ADS1115 settling error
+		float sum = t;
+		int count = 1;
+		for (int i = 0; i < 7; i++)
+		{
+			float s = readOilTempOnce();
+			if (!isnan(s)) { sum += s; count++; }
+		}
+		oilTempCached = sum / count;
+	}
 	else
 		oilTempCached += OIL_EMA_ALPHA * (t - oilTempCached);
 	// round to 0.5°C steps to avoid flickering
