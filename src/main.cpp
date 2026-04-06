@@ -158,7 +158,7 @@ float dbgOilVoltage = NAN;  // last raw ADS voltage (debug)
 float DS18B20_OFFSET = -1.2f;
 
 float battVoltageCached = NAN;
-const float BATT_EMA_ALPHA = 0.2f;
+const float BATT_EMA_ALPHA = 0.5f;
 
 // round-robin ADS1115 scheduling: one read per loop, rotate channels
 // slot 0 = oil (ADS ch0), slot 1 = Blitzer alive (ADS ch1), slot 2 = battery (ADS ch2)
