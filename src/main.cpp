@@ -69,7 +69,7 @@
 #include <Adafruit_BNO08x.h>
 
 #include <BH1750.h>
-#include <Adafruit_ADS1X15.h> // ADC expander for extra analog inputs
+#include <Adafruit_ADS1X15.h>
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -96,9 +96,8 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, OLED_CS);
 
 // ---------------- BNO085 ----------------
-Adafruit_BNO08x bno(-1);  // -1 = no reset pin, using I2C
+Adafruit_BNO08x bno(-1);
 bool bnoOk = false;
-// cached sensor values updated every loop
 float bno085Roll   = 0.0f;
 float bno085LinX   = 0.0f;
 float bno085LinY   = 0.0f;
@@ -108,9 +107,8 @@ BH1750 lightMeter;
 bool bhOk = false;
 
 // ---------------- ADS1115 analog expander ----------------
-Adafruit_ADS1115 ads; // default I2C address 0x48
+Adafruit_ADS1115 ads;
 
-// channels
 #define ADS_CH_OIL            0 // A0: oil temperature NTC
 #define ADS_CH_BLITZER_ALIVE  1 // A1: Blitzer-Warner heartbeat LED line
 #define ADS_CH_BATT           2 // A2: battery voltage divider
@@ -138,37 +136,35 @@ float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text
 // When active: oil temp cycles -5..120°C, lean angle cycles -90..+90°
 
 // ---------------- one‑wire / outside temp ----------------
-#define ONE_WIRE_PIN 7  // GPIO7 - safe on ESP32-S3 N16R8 (GPIO35-37 = PSRAM, avoid)
+#define ONE_WIRE_PIN 7
 OneWire oneWire(ONE_WIRE_PIN);
 DallasTemperature dsSensors(&oneWire);
 
-// outside temperature cache
 float outsideTemp = NAN;
 unsigned long lastOutsideMs = 0;
-const unsigned long OUTSIDE_INTERVAL_MS = 5000; // sample every 5 seconds
-bool outsideConvRequested = false;  // async DS18B20 flag
-DeviceAddress outsideSensorAddr;    // stored sensor address
-bool ds18b20Found = false;          // sensor discovered?
+const unsigned long OUTSIDE_INTERVAL_MS = 5000;
+bool outsideConvRequested = false;
+DeviceAddress outsideSensorAddr;
+bool ds18b20Found = false;
 
-// oil temperature cache
 float oilTempCached = NAN;
-const float OIL_EMA_ALPHA = 0.05f;  // smoothing factor for oil temp
+const float OIL_EMA_ALPHA = 0.5f;
 float dbgOilVoltage = NAN;  // last raw ADS voltage (debug)
+
+// ---- set to 1 to show raw ADS voltage on oil page ----
+#define OIL_DEBUG 0
 
 // DS18B20 calibration offset (add to raw reading) – runtime, saved in EEPROM
 float DS18B20_OFFSET = -1.2f;
 
-// battery voltage cache
 float battVoltageCached = NAN;
-const float BATT_EMA_ALPHA = 0.2f;  // smoothing factor for battery
+const float BATT_EMA_ALPHA = 0.2f;
 
 // round-robin ADS1115 scheduling: one read per loop, rotate channels
 // slot 0 = oil (ADS ch0), slot 1 = Blitzer alive (ADS ch1), slot 2 = battery (ADS ch2)
 unsigned long lastAdsReadMs = 0;
-const unsigned long ADS_READ_INTERVAL_MS = 100;  // one ADS read every 100ms
-uint8_t adsNextChannel = 0;  // 0 = oil, 1 = blitzer alive, 2 = battery
-
-// ADS1115 init flag
+const unsigned long ADS_READ_INTERVAL_MS = 100;
+uint8_t adsNextChannel = 0;
 bool adsOk = false;
 
 // ---------------- Night Mode 2.0 ----------------
@@ -207,16 +203,16 @@ bool raceboxBle = false;
 bool raceboxRec = false;
 unsigned long raceboxRecLastActiveMs = 0;
 bool raceboxRecEverSeen  = false;
-unsigned long raceboxRecLowSinceMs  = 0; // debounce for EverSeen
+unsigned long raceboxRecLowSinceMs  = 0;
 #define RACEBOX_REC_HOLD_MS 3000
 #define RACEBOX_BTN_PIN 18  // OUTPUT: drives NPN transistor to simulate RaceBox button press (active HIGH)
-unsigned long raceboxBtnUntilMs = 0;    // when to release the simulated button
+unsigned long raceboxBtnUntilMs = 0;
 unsigned long raceboxBtnCooldownMs = 0; // prevent re-trigger while holding
 bool raceboxBtnArmed = true;            // only fire once per button press cycle
 #define RACEBOX_LONGPRESS_MS 250        // shorter long press threshold for RaceBox page
 
 // ---------------- Blitzer Warner ----------------
-#define BLITZER_PIN 14      // GPIO14 - safe on ESP32-S3 N16R8
+#define BLITZER_PIN 14
 unsigned long blitzerActiveUntilMs = 0;
 bool blitzerPinLast = true;        // for edge detection (HIGH = idle with PULLUP)
 unsigned long blitzerLowSinceMs = 0; // debounce: timestamp when pin first went LOW
@@ -258,7 +254,7 @@ unsigned long raceboxBleAliveLastMs = 0;   // last time BLE pin was LOW after Pi
 #define RACEBOX_BLE_ALIVE_TIMEOUT_MS 10000 // show "ON" for 10s after last blink
 Page page = PAGE_OIL;
 
-#define BTN_PIN  4          // GPIO4 - safe on ESP32-S3 N16R8 (GPIO13 = SPI2_MISO, avoid)
+#define BTN_PIN  4
 #define DEBOUNCE_MS 15
 #define LONGPRESS_MS 800
 
@@ -280,7 +276,6 @@ unsigned long resetAnimUntilMs = 0;
 #define SETTINGS_TIMEOUT_MS 10000 // auto-close after 10s inactivity
 #define SETTINGS_LONGPRESS_MS 600 // long press inside settings = change value
 
-// Items
 enum SettingsItem : uint8_t {
 	SET_DS18_OFFSET = 0,  // outside temp offset
 	SET_G_DEAD,           // G-force deadzone
@@ -295,10 +290,11 @@ uint8_t brightMode = 0;
 bool leanFlip = false;  // true = invert roll direction (sensor mounted mirrored)
 
 bool settingsOpen = false;
-uint8_t settingsIdx = 0;           // currently selected item
+uint8_t settingsIdx = 0;
 unsigned long settingsLastActMs = 0; // last interaction time (for timeout)
 bool settingsLongFired = false;    // long-press-in-settings already fired
 unsigned long settingsPressStartMs = 0;
+bool settingsEnterReleasePending = false; // ignore first release after entering settings
 
 void drawSettingsPage();
 
@@ -311,7 +307,6 @@ void drawSettingsPage();
 #define R0 10000.0
 #define T0C 25.0
 #define BETA 3450.0
-// ADC on ESP32: 12-bit (0..4095) and Vref ~3.3V (adjust if using calibration)
 #define ADC_MAX 4095.0f
 #define ADC_VREF 3.3f
 
@@ -333,8 +328,8 @@ const float LEAN_DEADZONE_DEG = 2.0f;
 
 // All-time max (EEPROM)
 float maxLeanSaved = 0.0f;
-float maxLeanLeft  = 0.0f;  // all-time max lean to the left
-float maxLeanRight = 0.0f;  // all-time max lean to the right
+float maxLeanLeft  = 0.0f;
+float maxLeanRight = 0.0f;
 
 // Curve Peak Hold
 float cornerPeak = 0.0f;
@@ -467,7 +462,6 @@ static float bno085QuatToRoll(float qi, float qj, float qk, float qr)
 	return asinf(sinp) * (180.0f / M_PI);
 }
 
-// Poll all pending BNO085 events and cache roll + linear accel
 static void pollBno085()
 {
 	if (!bnoOk) return;
@@ -677,7 +671,12 @@ void buttonUpdate()
 			// ---- button released ----
 			if (settingsOpen)
 			{
-				if (btn.pressed && !settingsLongFired)
+				if (settingsEnterReleasePending)
+				{
+					// ignore this release – it's the release of the hold that opened settings
+					settingsEnterReleasePending = false;
+				}
+				else if (btn.pressed && !settingsLongFired)
 				{
 					// short press in settings → next item
 					settingsIdx = (settingsIdx + 1) % SET_COUNT;
@@ -773,6 +772,7 @@ void buttonUpdate()
 					settingsIdx   = 0;
 					settingsLastActMs = now;
 					settingsLongFired = false;
+					settingsEnterReleasePending = true; // suppress next release
 				}
 				return; // on oil page, no other long-press action exists
 			}
@@ -904,8 +904,7 @@ void updateOilTemp()
 	}
 	else
 		oilTempCached += OIL_EMA_ALPHA * (t - oilTempCached);
-	// round to 0.5°C steps to avoid flickering
-	oilTempCached = roundf(oilTempCached * 2.0f) / 2.0f;
+	// note: rounding happens at display time only (drawOilPage uses (int)round)
 }
 
 float readBatteryVoltage()
@@ -929,7 +928,6 @@ void updateAdsReadings()
 
 	if (adsNextChannel == 0)
 	{
-		// oil temp
 		updateOilTemp();
 		adsNextChannel = 1;
 	}
@@ -946,7 +944,6 @@ void updateAdsReadings()
 	}
 	else
 	{
-		// battery voltage
 		float v = readBatteryVoltage();
 		if (!isnan(v))
 		{
@@ -1479,7 +1476,7 @@ static void drawSnowflakeWarning(int16_t cx, int16_t cy)
 static void drawBatteryTopRight()
 {
 	float batt = battVoltageCached;
-	if (isnan(batt))
+	if (isnan(batt) || batt < 1.0f)
 		return;
 	bool lowBatt = (batt < BATT_LOW_V);
 	if (lowBatt && ((millis() / 400) % 2) == 0)
@@ -1530,6 +1527,7 @@ void drawOilPage(float oilC)
 		display.setCursor(x, baselineY);
 		display.print(s);
 		// debug: show reason below title, above bar
+		#if OIL_DEBUG
 		display.setFont();
 		display.setTextSize(1);
 		display.setCursor(0, 20);
@@ -1539,11 +1537,12 @@ void drawOilPage(float oilC)
 			display.print("V:NaN");
 		else
 		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
+		#endif
 	}
 	else
 	{
 		drawCenteredBigNumberWithDegree((int)round(oilC), baselineY);
-		// debug voltage always visible
+		#if OIL_DEBUG
 		display.setFont();
 		display.setTextSize(1);
 		display.setCursor(0, 20);
@@ -1553,6 +1552,7 @@ void drawOilPage(float oilC)
 			display.print("V:NaN");
 		else
 		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
+		#endif
 	}
 
 	display.setFont();
@@ -2122,17 +2122,14 @@ void bootProgressInitAndMaybeCalibrate()
 	// show instantly
 	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.0f);
 
-	// EEPROM
 	eepromOk = loadMaxValues();
 	stEe = eepromOk ? 1 : 0;
 	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.15f);
 
-	// BH1750
 	bhOk = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
 	stBh = bhOk ? 1 : 0;
 	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.3f);
 
-	// ADS1115
 	adsOk = ads.begin();
 	stAds = adsOk ? 1 : 0;
 	if (adsOk) {
@@ -2147,7 +2144,6 @@ void bootProgressInitAndMaybeCalibrate()
 	}
 	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.45f);
 
-	// BNO085
 	bnoOk = bno.begin_I2C();
 	if (bnoOk)
 	{
@@ -2183,7 +2179,7 @@ void bootProgressInitAndMaybeCalibrate()
 			if (holdStart == 0)
 				holdStart = now;
 			if (!calArmed && (now - holdStart) >= 250)
-				calArmed = true; // latch
+				calArmed = true;
 		}
 		else
 		{
@@ -2260,6 +2256,8 @@ void setup()
 {
 	Serial.begin(115200);
 	delay(200);
+
+	neopixelWrite(48, 0, 0, 0); // board RGB LED off
 
 	pinMode(BTN_PIN, INPUT_PULLUP);
 	pinMode(RACEBOX_BTN_PIN, OUTPUT);
