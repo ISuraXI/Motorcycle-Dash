@@ -99,8 +99,10 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, O
 Adafruit_BNO08x bno(-1);
 bool bnoOk = false;
 float bno085Roll   = 0.0f;
+float bno085Pitch  = 0.0f;  // forward/backward tilt of sensor in degrees
 float bno085LinX   = 0.0f;
 float bno085LinY   = 0.0f;
+float bno085LinZ   = 0.0f;
 
 // ---------------- BH1750 ----------------
 BH1750 lightMeter;
@@ -272,15 +274,16 @@ struct ButtonState
 unsigned long resetAnimUntilMs = 0;
 
 // ---------------- Settings ----------------
-#define SETTINGS_OPEN_MS   5000   // hold duration to enter settings
-#define SETTINGS_TIMEOUT_MS 10000 // auto-close after 10s inactivity
-#define SETTINGS_LONGPRESS_MS 600 // long press inside settings = change value
+#define SETTINGS_OPEN_MS      5000   // hold duration to enter settings
+#define SETTINGS_TIMEOUT_MS   10000  // auto-close after 10s inactivity
+#define SETTINGS_LONGPRESS_MS 600    // long press inside settings = change value
+#define SLEEP_COUNTDOWN_MS    3000   // delay before display goes dark after activating sleep
 
 enum SettingsItem : uint8_t {
-	SET_DS18_OFFSET = 0,  // outside temp offset
-	SET_G_DEAD,           // G-force deadzone
-	SET_BRIGHTNESS,       // brightness mode: 0=Auto, 1=Tag, 2=Nacht
+	SET_BRIGHTNESS = 0,   // brightness mode: 0=Auto, 1=Tag, 2=Nacht
+	SET_PITCH_OFFSET,     // sensor pitch correction for G-force
 	SET_LEAN_FLIP,        // invert lean angle direction
+	SET_NIGHT_SLEEP,      // turn display off (button wakes)
 	SET_RESET_ALL,        // reset all max values
 	SET_COUNT
 };
@@ -295,6 +298,10 @@ unsigned long settingsLastActMs = 0; // last interaction time (for timeout)
 bool settingsLongFired = false;    // long-press-in-settings already fired
 unsigned long settingsPressStartMs = 0;
 bool settingsEnterReleasePending = false; // ignore first release after entering settings
+
+bool displaySleeping = false;           // display off, wakes on button press
+bool sleepCountdownActive = false;      // countdown before display turns off
+unsigned long sleepCountdownStartMs = 0;
 
 void drawSettingsPage();
 
@@ -357,6 +364,7 @@ float gXFast = 0.0f, gYFast = 0.0f;   // fast-filtered (max-G tracking)
 const float G_ALPHA_DISPLAY = 0.10f;   // träge → wenig Jitter auf dem Dot
 const float G_ALPHA_MAX     = 0.20f;   // schneller → echte Manöver landen im Max
 float G_DEADZONE            = 0.04f;   // Motorvibrationen < 0.04g werden ignoriert – runtime, saved in EEPROM
+float pitchOffsetDeg        = 0.0f;    // sensor pitch correction in degrees (saved in EEPROM)
 
 float maxGSaved = 0.0f;
 
@@ -391,6 +399,7 @@ static uint8_t gQuadrant(float gx, float gy)
 #define EE_SET_G_DEAD    12  // uint8_t hundredths g  (0..20    → 0..0.20g)
 #define EE_SET_BRIGHT    14  // uint8_t 0=Auto 1=Tag 2=Nacht
 #define EE_SET_LEAN_FLIP 13  // uint8_t 0/1
+#define EE_SET_PITCH_OFF 15  // int8_t  degrees -20..+20
 
 bool maxDirty = false;
 unsigned long lastEESaveMs = 0;
@@ -461,6 +470,13 @@ static float bno085QuatToRoll(float qi, float qj, float qk, float qr)
 	sinp = clampf(sinp, -1.0f, 1.0f);
 	return asinf(sinp) * (180.0f / M_PI);
 }
+// Convert GAME_ROTATION_VECTOR quaternion → forward/backward tilt in degrees (X-axis rotation)
+static float bno085QuatToPitch(float qi, float qj, float qk, float qr)
+{
+	float sinr = 2.0f * (qr * qi + qj * qk);
+	float cosr = 1.0f - 2.0f * (qi * qi + qj * qj);
+	return atan2f(sinr, cosr) * (180.0f / M_PI);
+}
 
 static void pollBno085()
 {
@@ -475,11 +491,17 @@ static void pollBno085()
 				ev.un.gameRotationVector.j,
 				ev.un.gameRotationVector.k,
 				ev.un.gameRotationVector.real);
+			bno085Pitch = bno085QuatToPitch(
+				ev.un.gameRotationVector.i,
+				ev.un.gameRotationVector.j,
+				ev.un.gameRotationVector.k,
+				ev.un.gameRotationVector.real);
 		}
 		else if (ev.sensorId == SH2_LINEAR_ACCELERATION)
 		{
 			bno085LinX = ev.un.linearAcceleration.x;
 			bno085LinY = ev.un.linearAcceleration.y;
+			bno085LinZ = ev.un.linearAcceleration.z;
 		}
 	}
 }
@@ -558,14 +580,12 @@ bool loadMaxValues()
 		// Settings – only load if their own magic byte is present
 		if (EEPROM.read(EE_SET_MAGIC) == EE_SET_MAGIC_VAL)
 		{
-			int8_t  eeDs18  = (int8_t) EEPROM.read(EE_SET_DS18_OFF);
-			uint8_t eeGDead = EEPROM.read(EE_SET_G_DEAD);
 			uint8_t eeFlip   = EEPROM.read(EE_SET_LEAN_FLIP);
 			uint8_t eeBright = EEPROM.read(EE_SET_BRIGHT);
-			DS18B20_OFFSET = clampf((float)eeDs18  / 10.0f, -3.0f,  3.0f);
-			G_DEADZONE     = clampf((float)eeGDead / 100.0f, 0.0f,  0.20f);
+			int8_t  eePitch  = (int8_t)EEPROM.read(EE_SET_PITCH_OFF);
 			brightMode     = (eeBright <= 2) ? eeBright : 0;
 			leanFlip       = (eeFlip == 1);
+			pitchOffsetDeg = clampf((float)eePitch, -20.0f, 20.0f);
 		}
 		// else: keep compile-time defaults (DS18B20_OFFSET=-1.2, BATT_LOW_V=10.5, G_DEADZONE=0.04)
 	}
@@ -620,10 +640,9 @@ void saveMaxValuesNow()
 
 	// Settings
 	EEPROM.write(EE_SET_MAGIC,     EE_SET_MAGIC_VAL);
-	EEPROM.write(EE_SET_DS18_OFF,  (uint8_t)(int8_t)lroundf(DS18B20_OFFSET * 10.0f));
-	EEPROM.write(EE_SET_G_DEAD,    (uint8_t)lroundf(G_DEADZONE * 100.0f));
 	EEPROM.write(EE_SET_BRIGHT,    brightMode);
 	EEPROM.write(EE_SET_LEAN_FLIP, leanFlip ? 1 : 0);
+	EEPROM.write(EE_SET_PITCH_OFF, (uint8_t)(int8_t)lroundf(pitchOffsetDeg));
 
 	EEPROM.commit();
 }
@@ -660,6 +679,15 @@ void buttonUpdate()
 
 		if (btn.stableLevel == LOW)
 		{
+			// Wake display if sleeping – consume this press
+			if (displaySleeping)
+			{
+				display.ssd1306_command(SSD1306_DISPLAYON);
+				displaySleeping = false;
+				sleepCountdownActive = false;
+				btn.longFired = true; // suppress any page change on release
+				return;
+			}
 			btn.pressed = true;
 			btn.pressStartMs = now;
 			btn.longFired = false;
@@ -717,35 +745,26 @@ void buttonUpdate()
 
 				switch (settingsIdx)
 				{
-					case SET_DS18_OFFSET:
-					DS18B20_OFFSET += 0.5f;
-						if (DS18B20_OFFSET > 3.0f) DS18B20_OFFSET = -3.0f;
-						break;
-				case SET_G_DEAD:
-					{
-						// fixed presets: 0.00 → 0.02 → 0.04 → 0.06 → 0.10 → 0.15 → 0.20 → 0.00 ...
-						static const float kGDeadPresets[] = { 0.00f, 0.02f, 0.04f, 0.06f, 0.10f, 0.15f, 0.20f };
-						static const uint8_t kGDeadN = sizeof(kGDeadPresets) / sizeof(kGDeadPresets[0]);
-						// find current index (nearest match)
-						uint8_t idx = 0;
-						float best = fabsf(G_DEADZONE - kGDeadPresets[0]);
-						for (uint8_t p = 1; p < kGDeadN; p++) {
-							float d = fabsf(G_DEADZONE - kGDeadPresets[p]);
-							if (d < best) { best = d; idx = p; }
-						}
-						idx = (idx + 1) % kGDeadN;
-						G_DEADZONE = kGDeadPresets[idx];
-					}
-						break;
 					case SET_BRIGHTNESS:
 						brightMode = (brightMode + 1) % 3;
 						// apply immediately
 						if (brightMode == 1) oledSetContrast(CONTRAST_DAY);
 						else if (brightMode == 2) oledSetContrast(CONTRAST_NIGHT);
 						break;
+					case SET_PITCH_OFFSET:
+						// capture current sensor pitch as offset
+						pitchOffsetDeg = clampf(bno085Pitch, -20.0f, 20.0f);
+						break;
 					case SET_LEAN_FLIP:
-					leanFlip = !leanFlip;
-					break;
+						leanFlip = !leanFlip;
+						break;
+					case SET_NIGHT_SLEEP:
+						// close settings and start sleep countdown
+						settingsOpen = false;
+						saveMaxValuesNow();
+						sleepCountdownActive = true;
+						sleepCountdownStartMs = now;
+						return;
 					case SET_RESET_ALL:
 						maxLeanSaved = 0.0f;
 						maxLeanLeft  = 0.0f;
@@ -1121,7 +1140,12 @@ void updateGForce()
 	float gxNow = bno085LinX / G0;
 	float gyNow = bno085LinY / G0;
 
-	// Deadzone: Motorvibrationen unter Schwellwert auf Null setzen
+	// Pitch correction: rotate sensor Y/Z to vehicle frame if sensor is mounted tilted
+	if (pitchOffsetDeg != 0.0f)
+	{
+		float p = pitchOffsetDeg * (float)(M_PI / 180.0);
+		gyNow = (bno085LinY * cosf(p) + bno085LinZ * sinf(p)) / G0;
+	}
 	if (fabsf(gxNow) < G_DEADZONE) gxNow = 0.0f;
 	if (fabsf(gyNow) < G_DEADZONE) gyNow = 0.0f;
 
@@ -1899,10 +1923,10 @@ void drawSettingsPage()
 
 	// Items – 5 rows of 10px each starting at y=13
 	const char* labels[SET_COUNT] = {
-		"AuTemp Offset",
-		"G-Deadzone",
 		"Helligkeit",
+		"Pitch Offset",
 		"Lean flip",
+		"Nacht-Modus",
 		"Alles loeschen"
 	};
 
@@ -1920,20 +1944,20 @@ void drawSettingsPage()
 
 		switch (i)
 		{
-			case SET_DS18_OFFSET:
-				snprintf(valBuf, sizeof(valBuf), "%+.1fC", DS18B20_OFFSET);
-				break;
-			case SET_G_DEAD:
-				snprintf(valBuf, sizeof(valBuf), "%.2fg", G_DEADZONE);
-				break;
 			case SET_BRIGHTNESS:
 			{
 				const char* bNames[] = { "Auto", "Tag", "Nacht" };
 				snprintf(valBuf, sizeof(valBuf), "%s", bNames[brightMode]);
 				break;
 			}
+			case SET_PITCH_OFFSET:
+				snprintf(valBuf, sizeof(valBuf), "%+.0f Grad", pitchOffsetDeg);
+				break;
 			case SET_LEAN_FLIP:
 				snprintf(valBuf, sizeof(valBuf), "%s", leanFlip ? "AN" : "AUS");
+				break;
+			case SET_NIGHT_SLEEP:
+				snprintf(valBuf, sizeof(valBuf), "HOLD");
 				break;
 			case SET_RESET_ALL:
 				snprintf(valBuf, sizeof(valBuf), "HOLD");
@@ -2446,12 +2470,23 @@ void loop()
 		}
 		#endif
 
+		// Sleep countdown: turn display off after SLEEP_COUNTDOWN_MS
+		if (sleepCountdownActive && (now - sleepCountdownStartMs) >= (unsigned long)SLEEP_COUNTDOWN_MS)
+		{
+			sleepCountdownActive = false;
+			displaySleeping = true;
+			display.ssd1306_command(SSD1306_DISPLAYOFF);
+		}
+
 		// settings overlay takes priority over everything except blitzer
-		if (settingsOpen)
+		if (displaySleeping)
+		{
+			// display is off – nothing to draw
+		}
+		else if (settingsOpen)
 		{
 			drawSettingsPage();
 		}
-		// blitzer overlay takes over entire display
 		else if (millis() < blitzerActiveUntilMs)
 		{
 			bool flashOn = ((millis() / 200) % 2) == 0;
