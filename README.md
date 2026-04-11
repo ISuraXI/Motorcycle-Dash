@@ -9,6 +9,7 @@ A custom motorcycle dashboard built on the **ESP32-S3 N16R8** (16 MB Flash, 8 MB
 | Feature | Details |
 |---|---|
 | **Oil temperature** | NTC resistor read via ADS1115 (CH0), EMA-smoothed |
+| **Coolant temperature** | OBD2 PID 0x05 via CAN bus (TWAI), displayed on Oil page |
 | **Lean angle** | BNO085 IMU over I2C, all-time max stored in EEPROM |
 | **G-force** | BNO085 linear acceleration, all-time max stored in EEPROM |
 | **Battery voltage** | 33 kΩ / 10 kΩ divider on ADS1115 CH2, calibration offset |
@@ -41,8 +42,10 @@ A custom motorcycle dashboard built on the **ESP32-S3 N16R8** (16 MB Flash, 8 MB
 | Blitzer-Warner | Digital alert (INPUT_PULLUP) | 14 |
 | RaceBox Mini | GPS fix | 15 |
 | RaceBox Mini | BLE connected | 16 |
-| RaceBox Mini | Recording | 17 |
-| RaceBox Mini | Simulated button (NPN) | 18 |
+| RaceBox Mini | Recording | 2 |
+| RaceBox Mini | Simulated button (NPN) | 3 |
+| CAN bus (TWAI) | TX | 18 |
+| CAN bus (TWAI) | RX | 17 |
 
 ### I2C Devices
 
@@ -69,7 +72,7 @@ Short button press cycles through pages: **OIL → LEAN → G → RACEBOX → OI
 
 | Page | Content | Long-press action |
 |---|---|---|
-| OIL | Oil temperature (°C), outside temp, battery voltage | — |
+| OIL | Oil temp (°C), coolant temp (OBD2), outside temp, battery voltage | — |
 | LEAN | Current & all-time max lean angle | Reset all-time max (EEPROM) |
 | G | Current & all-time max G-force | Reset all-time max (EEPROM) |
 | RACEBOX | GPS fix / BLE / recording status, auto-start recording | — |
