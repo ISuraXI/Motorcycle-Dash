@@ -72,10 +72,10 @@ Short button press cycles through pages: **OIL → LEAN → G → RACEBOX → OI
 
 | Page | Content | Long-press action |
 |---|---|---|
-| OIL | Oil temp (°C), coolant temp (OBD2), outside temp, battery voltage | — |
+| OIL | Oil temp (°C), coolant temp (OBD2), outside temp, battery voltage | Open settings |
 | LEAN | Current & all-time max lean angle | Reset all-time max (EEPROM) |
 | G | Current & all-time max G-force | Reset all-time max (EEPROM) |
-| RACEBOX | GPS fix / BLE / recording status, auto-start recording | — |
+| RACEBOX | GPS fix / BLE / recording status, auto-start recording | Start recording |
 
 ### Boot sequence
 1. OLED turns on immediately.
