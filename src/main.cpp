@@ -330,10 +330,10 @@ void drawSettingsPage();
 #define ADC_VREF 3.3f
 
 const float OIL_BAR_MIN_C = 0.0f;
-const float OIL_BAR_MAX_C = 120.0f;
-const float OIL_GOOD_MIN = 70.0f;
-const float OIL_GOOD_MAX = 90.0f;
-const float OIL_CRITICAL_C = 110.0f; // above this: full-screen warning overlay
+const float OIL_BAR_MAX_C = 135.0f;
+const float OIL_GOOD_MIN = 80.0f;
+const float OIL_GOOD_MAX = 100.0f;
+const float OIL_CRITICAL_C = 125.0f; // above this: full-screen warning overlay
 
 // ---------------- Lean ----------------
 float rollFiltered = 0.0f;
@@ -1469,17 +1469,17 @@ void drawHatchedRect(int x, int y, int w, int h, int spacing)
 // Drawn at top-left corner (radius 2, center (2,4)) – 4px wide, sits just left of outside-temp text.
 void drawBlitzerWarnerAliveIndicator()
 {
-	// Nur anzeigen wenn Warner schon mal da war, aber jetzt offline ist
-	if (!blitzerAliveReceived)
-		return;
-
-	bool alive = (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
+	bool alive = blitzerAliveReceived &&
+	             (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
 	if (alive)
-		return; // läuft normal → kein Punkt
+		return; // läuft normal → kein Indikator
 
-	// Warner offline → blinkender Kreis als Warnung
+	// Warner offline oder noch nie verbunden → blinkende kleine Striche links und rechts
 	if (((millis() / 400) % 2) == 0)
-		display.drawCircle(2, 4, 2, SSD1306_WHITE);
+	{
+		display.fillRect(0,   26, 3, 12, SSD1306_WHITE);
+		display.fillRect(125, 26, 3, 12, SSD1306_WHITE);
+	}
 }
 
 void drawOilBar(float oilC)
@@ -1517,7 +1517,7 @@ void drawOilBar(float oilC)
 	display.drawFastVLine(gx1, y - 2, h + 4, SSD1306_WHITE);
 	display.drawFastVLine(gx2, y - 2, h + 4, SSD1306_WHITE);
 
-	if (valid && oilC > 100.0f)
+	if (valid && oilC >= 115.0f)
 	{
 		bool on = ((millis() / 140) % 2) == 0;
 		if (on)
@@ -1577,28 +1577,23 @@ void drawOilPage(float oilC)
 	{
 		display.setCursor(SIDE_MARGIN, 2);
 		display.print(outsideTemp, 1);
-		display.print("C");
+		int16_t otDegX = display.getCursorX();
+		display.drawCircle(otDegX + 2, 1, 1, SSD1306_WHITE);
 		// ice warning: snowflake when at or below 0°C
 		if (outsideTemp <= 0.0f)
-			drawSnowflakeWarning(SIDE_MARGIN + 34, 5);
-	}
-	else
-	{
-		display.setCursor(SIDE_MARGIN, 2);
-		display.print("--");
+			drawSnowflakeWarning(otDegX + 8, 5);
 	}
 
-	// coolant temperature (OBD2 PID 0x05) – second line top-left
-	display.setCursor(SIDE_MARGIN, 12);
+	// coolant temperature (OBD2 PID 0x05) – bottom right, above oil bar
 	if (!isnan(coolantTempCached))
 	{
-		display.print("KW:");
-		display.print((int)round(coolantTempCached));
-		display.print("C");
-	}
-	else
-	{
-		display.print("KW:--");
+		char cwBuf[8];
+		snprintf(cwBuf, sizeof(cwBuf), "%d", (int)round(coolantTempCached));
+		int16_t cx1, cy1; uint16_t cw, ch;
+		display.getTextBounds(cwBuf, 0, 0, &cx1, &cy1, &cw, &ch);
+		display.setCursor(SCREEN_WIDTH - (int16_t)cw - 6 - SIDE_MARGIN, 47);
+		display.print(cwBuf);
+		display.drawCircle(display.getCursorX() + 2, 46, 1, SSD1306_WHITE);
 	}
 
 	int16_t baselineY = 45;
@@ -1644,14 +1639,12 @@ void drawOilPage(float oilC)
 	display.setFont();
 	display.setTextSize(1);
 
-	// status text: COLD below range, HOT above 95°C, nothing in OK range
+	// status text: COLD below range only
 	if (!isnan(oilC))
 	{
 		display.setCursor(2, 46);
 		if (oilC < 60.0f)
 			display.print("COLD");
-		else if (oilC > 95.0f)
-			display.print("HOT");
 	}
 
 	drawBatteryTopRight();
@@ -2533,9 +2526,10 @@ void loop()
 		// --- Test mode overrides ---
 		#ifdef TEST_MODE
 		{
-			oilTempCached    = triangleWave(-30.0f, 120.0f, 30000UL);
+			oilTempCached     = triangleWave(-30.0f, 130.0f, 30000UL);
 			battVoltageCached = triangleWave(0.0f,   15.0f,  12000UL);
-			outsideTemp      = triangleWave(-10.0f,  40.0f,  14000UL);
+			outsideTemp       = triangleWave(-10.0f,  40.0f,  14000UL);
+			coolantTempCached = triangleWave(20.0f,  125.0f, 25000UL);
 			float simLean = triangleWave(-90.0f, 90.0f, 8000UL);
 			rollUi        = simLean;
 			rollFiltered  = simLean;
@@ -2582,7 +2576,7 @@ void loop()
 			display.setTextColor(flashOn ? SSD1306_BLACK : SSD1306_WHITE);
 			display.setFont(&FreeSansBold18pt7b);
 			{
-				const char* hotTxt = "HOT";
+				const char* hotTxt = "OIL";
 				int16_t tx1, ty1; uint16_t tw, th;
 				display.getTextBounds(hotTxt, 0, 0, &tx1, &ty1, &tw, &th);
 				display.setCursor((SCREEN_WIDTH - (int16_t)tw) / 2 - tx1, 46);
@@ -2592,6 +2586,30 @@ void loop()
 			display.setTextSize(1);
 			char tbuf[8];
 			snprintf(tbuf, sizeof(tbuf), "%.0fC", oilTempCached);
+			display.setCursor(90, 0);
+			display.print(tbuf);
+			display.setTextColor(SSD1306_WHITE);
+			display.display();
+		}
+		else if (!isnan(coolantTempCached) && coolantTempCached >= 120.0f)
+		{
+			bool flashOn = ((millis() / 300) % 2) == 0;
+			display.clearDisplay();
+			if (flashOn)
+				display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
+			display.setTextColor(flashOn ? SSD1306_BLACK : SSD1306_WHITE);
+			display.setFont(&FreeSansBold18pt7b);
+			{
+				const char* hotTxt = "WATER";
+				int16_t tx1, ty1; uint16_t tw, th;
+				display.getTextBounds(hotTxt, 0, 0, &tx1, &ty1, &tw, &th);
+				display.setCursor((SCREEN_WIDTH - (int16_t)tw) / 2 - tx1, 46);
+				display.print(hotTxt);
+			}
+			display.setFont();
+			display.setTextSize(1);
+			char tbuf[8];
+			snprintf(tbuf, sizeof(tbuf), "%.0fC", coolantTempCached);
 			display.setCursor(90, 0);
 			display.print(tbuf);
 			display.setTextColor(SSD1306_WHITE);
