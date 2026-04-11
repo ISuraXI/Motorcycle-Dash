@@ -40,10 +40,14 @@
   RaceBox Mini inputs (all INPUT_PULLUP, HIGH = active)
     GPS fix  = GPIO 15
     BLE conn = GPIO 16
-    REC      = GPIO 17
+    REC      = GPIO 2   (moved from 17 to free GPIO for CAN bus)
 
   RaceBox simulated button (NPN transistor, active HIGH)
-    GPIO 18
+    GPIO 3   (moved from 18 to free GPIO for CAN bus)
+
+  CAN bus (TWAI – OBD2 Kühlwassertemperatur PID 0x05)
+    TX = GPIO 18
+    RX = GPIO 17
 
   OIL_PIN (legacy NTC direct-ADC fallback, not actively used)
     GPIO 1   ← oil temp is read via ADS1115 channel 0
@@ -76,6 +80,12 @@
 
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
+
+#include "driver/twai.h"
+
+// ---------------- CAN bus (TWAI) ----------------
+#define CAN_TX_PIN GPIO_NUM_18
+#define CAN_RX_PIN GPIO_NUM_17
 
 // ---------------- I2C (ESP32-S3: SDA=8, SCL=9)
 #define SDA_PIN 8
@@ -153,6 +163,8 @@ float oilTempCached = NAN;
 const float OIL_EMA_ALPHA = 0.5f;
 float dbgOilVoltage = NAN;  // last raw ADS voltage (debug)
 
+float coolantTempCached = NAN; // OBD2 PID 0x05 – Kühlwassertemperatur via CAN
+
 // ---- set to 1 to show raw ADS voltage on oil page ----
 #define OIL_DEBUG 0
 
@@ -198,7 +210,7 @@ enum Page : uint8_t
 // ---------------- RaceBox status inputs ----------------
 #define RACEBOX_GPS_PIN 15  // HIGH when GPS fix active  (GPIO26-32 = flash on ESP32-S3, avoid)
 #define RACEBOX_BLE_PIN 16  // HIGH when BLE connected
-#define RACEBOX_REC_PIN 17  // HIGH when recording active
+#define RACEBOX_REC_PIN 2   // HIGH when recording active (moved from 17 for CAN bus)
 
 bool raceboxGps = false;
 bool raceboxBle = false;
@@ -207,7 +219,7 @@ unsigned long raceboxRecLastActiveMs = 0;
 bool raceboxRecEverSeen  = false;
 unsigned long raceboxRecLowSinceMs  = 0;
 #define RACEBOX_REC_HOLD_MS 3000
-#define RACEBOX_BTN_PIN 18  // OUTPUT: drives NPN transistor to simulate RaceBox button press (active HIGH)
+#define RACEBOX_BTN_PIN 3   // OUTPUT: drives NPN transistor to simulate RaceBox button press (moved from 18 for CAN bus)
 unsigned long raceboxBtnUntilMs = 0;
 unsigned long raceboxBtnCooldownMs = 0; // prevent re-trigger while holding
 bool raceboxBtnArmed = true;            // only fire once per button press cycle
@@ -426,6 +438,7 @@ float readBatteryVoltage();
 void updateOutsideTemp();
 void updateOilTemp();
 void updateAdsReadings();
+void updateCan();
 
 void updateCurvePeakHold(float leanAbs);
 void updateLean();
@@ -858,6 +871,42 @@ float readOilTempOnce()
 	float tempK = 1.0f / ((1.0f / (T0C + 273.15f)) + (1.0f / BETA) * logf(rNtc / R0));
 	float tempC = tempK - 273.15f;
 	return tempC;
+}
+
+// =========================================================
+// CAN bus (TWAI) – OBD2 Kühlwassertemperatur
+// =========================================================
+void updateCan()
+{
+	static unsigned long lastCanRequestMs = 0;
+	unsigned long now = millis();
+
+	// send OBD2 request for PID 0x05 (coolant temp) every 1 s
+	if (now - lastCanRequestMs >= 1000)
+	{
+		lastCanRequestMs = now;
+		twai_message_t req;
+		req.identifier        = 0x18DB33F1; // functional broadcast
+		req.extd              = 1;
+		req.rtr               = 0;
+		req.data_length_code  = 8;
+		req.data[0] = 0x02; // length
+		req.data[1] = 0x01; // service 01 (show current data)
+		req.data[2] = 0x05; // PID: coolant temperature
+		req.data[3] = req.data[4] = req.data[5] = req.data[6] = req.data[7] = 0x00;
+		twai_transmit(&req, pdMS_TO_TICKS(10));
+	}
+
+	// non-blocking receive – drain all queued frames each call
+	twai_message_t resp;
+	while (twai_receive(&resp, 0) == ESP_OK)
+	{
+		if (resp.extd && resp.data_length_code >= 4 &&
+		    resp.data[1] == 0x41 && resp.data[2] == 0x05)
+		{
+			coolantTempCached = (float)(resp.data[3]) - 40.0f;
+		}
+	}
 }
 
 void updateOutsideTemp()
@@ -1537,6 +1586,19 @@ void drawOilPage(float oilC)
 	{
 		display.setCursor(SIDE_MARGIN, 2);
 		display.print("--");
+	}
+
+	// coolant temperature (OBD2 PID 0x05) – second line top-left
+	display.setCursor(SIDE_MARGIN, 12);
+	if (!isnan(coolantTempCached))
+	{
+		display.print("KW:");
+		display.print((int)round(coolantTempCached));
+		display.print("C");
+	}
+	else
+	{
+		display.print("KW:--");
 	}
 
 	int16_t baselineY = 45;
@@ -2315,6 +2377,15 @@ void setup()
 
 	// ADS1115 is initialized in bootProgressInitAndMaybeCalibrate()
 
+	// CAN bus (TWAI) – OBD2 Kühlwassertemperatur
+	{
+		twai_general_config_t g_cfg = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+		twai_timing_config_t  t_cfg = TWAI_TIMING_CONFIG_500KBITS();
+		twai_filter_config_t  f_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+		twai_driver_install(&g_cfg, &t_cfg, &f_cfg);
+		twai_start();
+	}
+
 	// configure hardware SPI pins before display.begin
 	// if you're using the default VSPI pins, SPI.begin() with no arguments is fine
 	// otherwise specify sck, miso, mosi, ss
@@ -2359,6 +2430,7 @@ void loop()
 	updateNightMode();
 	updateOutsideTemp();
 	updateAdsReadings();  // one ADS read per loop: oil or battery alternating
+	updateCan();          // CAN OBD2 request/receive for coolant temperature
 
 	saveMaxValuesSometimes();
 
