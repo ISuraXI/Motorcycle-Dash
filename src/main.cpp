@@ -144,10 +144,10 @@ const float BATT_CAL = 1.00833f;
 float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text) – runtime, saved in EEPROM
 
 // ---- Test mode: comment out to disable ----
-#define TEST_MODE
+// #define TEST_MODE
 // When active: sensors cycle through normal range, warnings NOT triggered
 // Use TEST_MODE_WARNINGS to also test warning screens
-// #define TEST_MODE_WARNINGS
+#define TEST_MODE_WARNINGS
 
 // ---------------- one‑wire / outside temp ----------------
 #define ONE_WIRE_PIN 7
@@ -473,6 +473,7 @@ void drawHatchedRect(int x, int y, int w, int h, int spacing = 3);
 void drawOilBar(float oilC);
 void drawOilPage(float oilC);
 void drawBlitzerWarnerAliveIndicator();
+void drawRpmRedlineBorder();
 static void drawBatteryTopRight();
 
 void drawLeanPage();
@@ -1603,6 +1604,19 @@ void drawHatchedRect(int x, int y, int w, int h, int spacing)
 	}
 }
 
+// Redline border flash at >= 10500 rpm – drawn on every page before display.display()
+void drawRpmRedlineBorder()
+{
+	if (!isnan(engineRpmCached) && engineRpmCached >= 10500.0f)
+	{
+		if (((millis() / 80) % 2) == 0)
+		{
+			display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+			display.drawRect(1, 1, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2, SSD1306_WHITE);
+		}
+	}
+}
+
 // Small heartbeat indicator: filled circle = alive, blinking = offline, nothing = initialising
 // Drawn at top-left corner (radius 2, center (2,4)) – 4px wide, sits just left of outside-temp text.
 void drawBlitzerWarnerAliveIndicator()
@@ -1800,6 +1814,7 @@ void drawOilPage(float oilC)
 			display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
 	}
 
+	drawRpmRedlineBorder();
 	display.display();
 }
 
@@ -1875,6 +1890,7 @@ void drawLeanPage()
 	}
 
 	drawBlitzerWarnerAliveIndicator();
+	drawRpmRedlineBorder();
 	display.display();
 }
 
@@ -1989,6 +2005,7 @@ void drawGPage()
 	}
 
 	drawBlitzerWarnerAliveIndicator();
+	drawRpmRedlineBorder();
 	display.display();
 }
 
@@ -2107,6 +2124,7 @@ void drawEnginePage()
 	}
 
 	drawBlitzerWarnerAliveIndicator();
+	drawRpmRedlineBorder();
 	display.display();
 }
 
@@ -2212,6 +2230,7 @@ void drawRaceBoxPage()
 	}
 
 	drawBlitzerWarnerAliveIndicator();
+	drawRpmRedlineBorder();
 	display.display();
 }
 
@@ -2787,10 +2806,14 @@ void loop()
 		// --- Test mode overrides ---
 		#ifdef TEST_MODE_WARNINGS
 		{
-			oilTempCached     = triangleWave(-30.0f, 130.0f, 30000UL);
-			battVoltageCached = triangleWave(0.0f,   15.0f,  12000UL);
-			outsideTemp       = triangleWave(-10.0f,  40.0f,  14000UL);
-			coolantTempCached = triangleWave(20.0f,  125.0f, 25000UL);
+			oilTempCached      = triangleWave(-30.0f, 130.0f, 30000UL);
+			battVoltageCached  = triangleWave(0.0f,   15.0f,  12000UL);
+			outsideTemp        = triangleWave(-10.0f,  40.0f,  14000UL);
+			coolantTempCached  = triangleWave(20.0f,  125.0f, 25000UL);
+			vehicleSpeedCached = triangleWave(0.0f,   120.0f, 20000UL);
+			engineRpmCached    = triangleWave(800.0f, 12000.0f, 15000UL);
+			engineLoadCached   = triangleWave(0.0f,   100.0f, 18000UL);
+			throttlePosCached  = triangleWave(0.0f,   100.0f, 12000UL);
 			float simLean = triangleWave(-90.0f, 90.0f, 8000UL);
 			rollUi        = simLean;
 			rollFiltered  = simLean;
