@@ -144,8 +144,10 @@ const float BATT_CAL = 1.00833f;
 float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text) – runtime, saved in EEPROM
 
 // ---- Test mode: comment out to disable ----
-// #define TEST_MODE
-// When active: oil temp cycles -5..120°C, lean angle cycles -90..+90°
+#define TEST_MODE
+// When active: sensors cycle through normal range, warnings NOT triggered
+// Use TEST_MODE_WARNINGS to also test warning screens
+// #define TEST_MODE_WARNINGS
 
 // ---------------- one‑wire / outside temp ----------------
 #define ONE_WIRE_PIN 7
@@ -164,9 +166,22 @@ const float OIL_EMA_ALPHA = 0.5f;
 float dbgOilVoltage = NAN;  // last raw ADS voltage (debug)
 
 float coolantTempCached = NAN; // OBD2 PID 0x05 – Kühlwassertemperatur via CAN
+float engineRpmCached   = NAN; // OBD2 PID 0x0C – Motordrehzahl
+float engineLoadCached  = NAN; // OBD2 PID 0x04 – Motorlast %
+float throttlePosCached = NAN; // OBD2 PID 0x11 – Drosselklappenstellung %
+float vehicleSpeedCached = NAN; // OBD2 PID 0x0D – Geschwindigkeit km/h
+
+// 0-100 km/h timer
+enum Sprint100State : uint8_t { S100_IDLE, S100_ARMED, S100_RUNNING, S100_DONE };
+Sprint100State sprint100State = S100_IDLE;
+unsigned long sprint100StartMs = 0;
+float sprint100Result = NAN;
 
 // ---- set to 1 to show raw ADS voltage on oil page ----
 #define OIL_DEBUG 0
+
+// ---- set to 1 to scan and print all supported OBD2 PIDs on boot (Serial 115200) ----
+#define CAN_PID_SCAN 0
 
 // DS18B20 calibration offset (add to raw reading) – runtime, saved in EEPROM
 float DS18B20_OFFSET = -1.2f;
@@ -204,7 +219,8 @@ enum Page : uint8_t
 	PAGE_OIL = 0,
 	PAGE_LEAN = 1,
 	PAGE_G = 2,
-	PAGE_RACEBOX = 3
+	PAGE_ENGINE = 3,
+	PAGE_RACEBOX = 4
 };
 
 // ---------------- RaceBox status inputs ----------------
@@ -439,6 +455,8 @@ void updateOutsideTemp();
 void updateOilTemp();
 void updateAdsReadings();
 void updateCan();
+void scanObdPids();
+void updateSprint100();
 
 void updateCurvePeakHold(float leanAbs);
 void updateLean();
@@ -461,6 +479,7 @@ void drawLeanPage();
 
 void drawGCircle(float gx, float gy, float maxGVal);
 void drawGPage();
+void drawEnginePage();
 void drawRaceBoxPage();
 
 void calibrateRollOffset();
@@ -809,7 +828,7 @@ void buttonUpdate()
 				return; // on oil page, no other long-press action exists
 			}
 
-			const unsigned long threshold = (page == PAGE_RACEBOX) ? RACEBOX_LONGPRESS_MS : LONGPRESS_MS;
+			const unsigned long threshold = (page == PAGE_RACEBOX || page == PAGE_ENGINE) ? RACEBOX_LONGPRESS_MS : LONGPRESS_MS;
 			if ((now - btn.pressStartMs) >= threshold)
 			{
 				btn.longFired = true;
@@ -829,6 +848,14 @@ void buttonUpdate()
 					memset(gQuadHasSlot, 0, sizeof(gQuadHasSlot));
 					maxDirty = true;
 					resetAnimUntilMs = now + 350;
+				}
+				else if (page == PAGE_ENGINE)
+				{
+					// arm / reset 0-100 timer
+					if (sprint100State == S100_IDLE || sprint100State == S100_DONE)
+						sprint100State = S100_ARMED;
+					else
+						sprint100State = S100_IDLE;
 				}
 				else if (page == PAGE_RACEBOX && raceboxBtnArmed)
 				{
@@ -878,35 +905,125 @@ float readOilTempOnce()
 // =========================================================
 void updateCan()
 {
+	// Round-robin 5 PIDs at 200ms interval → each PID updated every ~1s
+	static const uint8_t pidList[] = { 0x05, 0x0C, 0x04, 0x11, 0x0D };
+	static uint8_t pidIdx = 0;
 	static unsigned long lastCanRequestMs = 0;
 	unsigned long now = millis();
 
-	// send OBD2 request for PID 0x05 (coolant temp) every 1 s
-	if (now - lastCanRequestMs >= 1000)
+	if (now - lastCanRequestMs >= 200)
 	{
 		lastCanRequestMs = now;
 		twai_message_t req;
-		req.identifier        = 0x18DB33F1; // functional broadcast
+		req.identifier        = 0x18DB33F1;
 		req.extd              = 1;
 		req.rtr               = 0;
 		req.data_length_code  = 8;
-		req.data[0] = 0x02; // length
-		req.data[1] = 0x01; // service 01 (show current data)
-		req.data[2] = 0x05; // PID: coolant temperature
+		req.data[0] = 0x02;
+		req.data[1] = 0x01;
+		req.data[2] = pidList[pidIdx];
 		req.data[3] = req.data[4] = req.data[5] = req.data[6] = req.data[7] = 0x00;
 		twai_transmit(&req, pdMS_TO_TICKS(10));
+		pidIdx = (pidIdx + 1) % 5;
 	}
 
 	// non-blocking receive – drain all queued frames each call
 	twai_message_t resp;
 	while (twai_receive(&resp, 0) == ESP_OK)
 	{
-		if (resp.extd && resp.data_length_code >= 4 &&
-		    resp.data[1] == 0x41 && resp.data[2] == 0x05)
+		if (!resp.extd || resp.data_length_code < 4 || resp.data[1] != 0x41) continue;
+		switch (resp.data[2])
 		{
-			coolantTempCached = (float)(resp.data[3]) - 40.0f;
+			case 0x05: coolantTempCached  = (float)(resp.data[3]) - 40.0f; break;
+			case 0x0C: engineRpmCached    = (float)((resp.data[3] << 8) | resp.data[4]) / 4.0f; break;
+			case 0x04: engineLoadCached   = (float)(resp.data[3]) * 100.0f / 255.0f; break;
+			case 0x11: throttlePosCached  = (float)(resp.data[3]) * 100.0f / 255.0f; break;
+			case 0x0D: vehicleSpeedCached = (float)(resp.data[3]); break;
 		}
 	}
+}
+
+// =========================================================
+// OBD2 PID-Support-Scan (einmalig beim Boot, Serial output)
+// =========================================================
+void scanObdPids()
+{
+#if CAN_PID_SCAN
+	// Supported PIDs query groups: 0x00 (PIDs 01-20), 0x20 (21-40), 0x40 (41-60)
+	const uint8_t groups[] = {0x00, 0x20, 0x40};
+	Serial.println("=== OBD2 PID Scan ===");
+
+	for (uint8_t gi = 0; gi < 3; gi++)
+	{
+		uint8_t groupPid = groups[gi];
+
+		// send request
+		twai_message_t req;
+		req.identifier       = 0x18DB33F1;
+		req.extd             = 1;
+		req.rtr              = 0;
+		req.data_length_code = 8;
+		req.data[0] = 0x02;
+		req.data[1] = 0x01;
+		req.data[2] = groupPid;
+		req.data[3] = req.data[4] = req.data[5] = req.data[6] = req.data[7] = 0x00;
+		twai_transmit(&req, pdMS_TO_TICKS(50));
+
+		// wait up to 500 ms for response
+		twai_message_t resp;
+		bool got = false;
+		unsigned long t0 = millis();
+		while (millis() - t0 < 500)
+		{
+			if (twai_receive(&resp, pdMS_TO_TICKS(10)) == ESP_OK)
+			{
+				if (resp.extd && resp.data_length_code >= 6 &&
+				    resp.data[1] == 0x41 && resp.data[2] == groupPid)
+				{
+					got = true;
+					break;
+				}
+			}
+		}
+
+		if (!got)
+		{
+			Serial.print("Gruppe 0x");
+			Serial.print(groupPid, HEX);
+			Serial.println(": keine Antwort");
+			continue;
+		}
+
+		// decode bitmask: bytes A=data[3], B=data[4], C=data[5], D=data[6]
+		// bit 7 of A = PID groupPid+1, ... bit 0 of D = PID groupPid+32
+		uint32_t bitmask = ((uint32_t)resp.data[3] << 24) |
+		                   ((uint32_t)resp.data[4] << 16) |
+		                   ((uint32_t)resp.data[5] <<  8) |
+		                    (uint32_t)resp.data[6];
+
+		Serial.print("Gruppe 0x");
+		Serial.print(groupPid, HEX);
+		Serial.print(" → unterstützte PIDs: ");
+		bool any = false;
+		for (uint8_t bit = 0; bit < 32; bit++)
+		{
+			if (bitmask & (0x80000000UL >> bit))
+			{
+				Serial.print("0x");
+				uint8_t pid = groupPid + bit + 1;
+				if (pid < 0x10) Serial.print('0');
+				Serial.print(pid, HEX);
+				Serial.print(' ');
+				any = true;
+			}
+		}
+		if (!any) Serial.print("(keine)");
+		Serial.println();
+
+		delay(200); // kurz warten bevor nächste Gruppe
+	}
+	Serial.println("=== Scan fertig ===");
+#endif
 }
 
 void updateOutsideTemp()
@@ -1227,6 +1344,27 @@ void updateGForce()
 		{
 			gQuadPeaks[q][1] = np;
 			gQuadHasSlot[q][1] = true;
+		}
+	}
+}
+
+void updateSprint100()
+{
+	if (sprint100State == S100_RUNNING)
+	{
+		if (!isnan(vehicleSpeedCached) && vehicleSpeedCached >= 100.0f)
+		{
+			sprint100Result = (float)(millis() - sprint100StartMs) / 1000.0f;
+			sprint100State  = S100_DONE;
+		}
+	}
+	else if (sprint100State == S100_ARMED)
+	{
+		// auto-start as soon as speed leaves 0
+		if (!isnan(vehicleSpeedCached) && vehicleSpeedCached > 3.0f)
+		{
+			sprint100StartMs = millis();
+			sprint100State   = S100_RUNNING;
 		}
 	}
 }
@@ -1854,6 +1992,124 @@ void drawGPage()
 	display.display();
 }
 
+// =========================================================
+// Engine page
+// =========================================================
+void drawEnginePage()
+{
+	display.clearDisplay();
+	display.setTextColor(SSD1306_WHITE);
+	display.setFont();
+	display.setTextSize(1);
+
+	// ---- km/h – big number top center ----
+	{
+		display.setFont(&FreeSansBold18pt7b);
+		char kmhBuf[8];
+		if (!isnan(vehicleSpeedCached))
+			snprintf(kmhBuf, sizeof(kmhBuf), "%d", (int)round(vehicleSpeedCached));
+		else
+			snprintf(kmhBuf, sizeof(kmhBuf), "--");
+		int16_t x1, y1; uint16_t w, h;
+		display.getTextBounds(kmhBuf, 0, 0, &x1, &y1, &w, &h);
+		display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 26);
+		display.print(kmhBuf);
+		display.setFont();
+		// "km/h" label small, right of number
+		display.setTextSize(1);
+		display.setCursor((SCREEN_WIDTH + (int16_t)w) / 2 - x1 + 2, 15);
+		display.print("km/h");
+	}
+
+	display.setFont();
+	display.setTextSize(1);
+
+	// ---- Load % – bottom left ----
+	{
+		char buf[10];
+		if (!isnan(engineLoadCached))
+			snprintf(buf, sizeof(buf), "Ld:%d%%", (int)round(engineLoadCached));
+		else
+			snprintf(buf, sizeof(buf), "Ld:--");
+		display.setCursor(0, 34);
+		display.print(buf);
+	}
+
+	// ---- RPM – bottom right ----
+	{
+		char buf[12];
+		if (!isnan(engineRpmCached))
+			snprintf(buf, sizeof(buf), "%drpm", (int)round(engineRpmCached));
+		else
+			snprintf(buf, sizeof(buf), "--rpm");
+		int16_t x1, y1; uint16_t w, h;
+		display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+		display.setCursor(SCREEN_WIDTH - (int16_t)w - 1, 34);
+		display.print(buf);
+	}
+
+	// ---- Throttle bar ----
+	{
+		const int bx = 0, by = 43, bw = 128, bh = 9;
+		display.drawRect(bx, by, bw, bh, SSD1306_WHITE);
+		if (!isnan(throttlePosCached))
+		{
+			int fillW = (int)(throttlePosCached / 100.0f * (bw - 2));
+			if (fillW > 0)
+				display.fillRect(bx + 1, by + 1, fillW, bh - 2, SSD1306_WHITE);
+		}
+		// percentage centered in bar
+		if (!isnan(throttlePosCached))
+		{
+			char tbuf[6];
+			snprintf(tbuf, sizeof(tbuf), "%d%%", (int)round(throttlePosCached));
+			int16_t x1, y1; uint16_t w, h;
+			display.getTextBounds(tbuf, 0, 0, &x1, &y1, &w, &h);
+			bool fillHigh = (!isnan(throttlePosCached) && throttlePosCached >= 50.0f);
+			display.setTextColor(fillHigh ? SSD1306_BLACK : SSD1306_WHITE);
+			display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, by + 1);
+			display.print(tbuf);
+			display.setTextColor(SSD1306_WHITE);
+		}
+	}
+
+	// ---- 0-100 timer – bottom row ----
+	{
+		display.setCursor(30, 57);
+		switch (sprint100State)
+		{
+			case S100_IDLE:
+				display.print("0-100: hold to arm");
+				break;
+			case S100_ARMED:
+				display.print("0-100: READY - gas!");
+				break;
+			case S100_RUNNING:
+			{
+				float elapsed = (float)(millis() - sprint100StartMs) / 1000.0f;
+				char tbuf[16];
+				snprintf(tbuf, sizeof(tbuf), "0-100: %.1fs...", elapsed);
+				display.setCursor(0, 57);
+				display.print(tbuf);
+				break;
+			}
+			case S100_DONE:
+			{
+				char tbuf[16];
+				snprintf(tbuf, sizeof(tbuf), "0-100: %.2fs", sprint100Result);
+				int16_t x1, y1; uint16_t w, h;
+				display.getTextBounds(tbuf, 0, 0, &x1, &y1, &w, &h);
+				display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 57);
+				display.print(tbuf);
+				break;
+			}
+		}
+	}
+
+	drawBlitzerWarnerAliveIndicator();
+	display.display();
+}
+
 void drawRaceBoxPage()
 {
 	display.clearDisplay();
@@ -2378,6 +2634,10 @@ void setup()
 		twai_driver_install(&g_cfg, &t_cfg, &f_cfg);
 		twai_start();
 	}
+#if CAN_PID_SCAN
+	delay(500); // kurz warten bis CAN-Bus stabil ist
+	scanObdPids();
+#endif
 
 	// configure hardware SPI pins before display.begin
 	// if you're using the default VSPI pins, SPI.begin() with no arguments is fine
@@ -2424,6 +2684,7 @@ void loop()
 	updateOutsideTemp();
 	updateAdsReadings();  // one ADS read per loop: oil or battery alternating
 	updateCan();          // CAN OBD2 request/receive for coolant temperature
+	updateSprint100();    // 0-100 km/h timer state machine
 
 	saveMaxValuesSometimes();
 
@@ -2524,12 +2785,26 @@ void loop()
 		// Blitzer-Warner heartbeat is sampled in updateAdsReadings() via AIN1
 
 		// --- Test mode overrides ---
-		#ifdef TEST_MODE
+		#ifdef TEST_MODE_WARNINGS
 		{
 			oilTempCached     = triangleWave(-30.0f, 130.0f, 30000UL);
 			battVoltageCached = triangleWave(0.0f,   15.0f,  12000UL);
 			outsideTemp       = triangleWave(-10.0f,  40.0f,  14000UL);
 			coolantTempCached = triangleWave(20.0f,  125.0f, 25000UL);
+			float simLean = triangleWave(-90.0f, 90.0f, 8000UL);
+			rollUi        = simLean;
+			rollFiltered  = simLean;
+		}
+		#elif defined(TEST_MODE)
+		{
+			oilTempCached      = triangleWave(-30.0f, 120.0f, 30000UL); // bleibt unter 125°C (kein OIL-Screen)
+			battVoltageCached  = triangleWave(0.0f,   15.0f,  12000UL);
+			outsideTemp        = triangleWave(-10.0f,  40.0f,  14000UL);
+			coolantTempCached  = triangleWave(20.0f,  115.0f, 25000UL); // bleibt unter 120°C (kein WATER-Screen)
+			vehicleSpeedCached = triangleWave(0.0f,   120.0f, 20000UL);
+			engineRpmCached    = triangleWave(800.0f, 10000.0f, 15000UL);
+			engineLoadCached   = triangleWave(0.0f,   100.0f, 18000UL);
+			throttlePosCached  = triangleWave(0.0f,   100.0f, 12000UL);
 			float simLean = triangleWave(-90.0f, 90.0f, 8000UL);
 			rollUi        = simLean;
 			rollFiltered  = simLean;
@@ -2626,6 +2901,10 @@ void loop()
 		else if (page == PAGE_G)
 		{
 			drawGPage();
+		}
+		else if (page == PAGE_ENGINE)
+		{
+			drawEnginePage();
 		}
 		else
 		{
