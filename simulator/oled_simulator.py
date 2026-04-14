@@ -522,7 +522,9 @@ def draw_oil_page(d: OledSurface, st: State):
     # Col 3: BATT (Batteriespannung)
     d.text_small("BATT", 88, 52)
     if st.batt_v >= 1.0:
-        d.text_small(f"{st.batt_v:.1f}V", 88, 60)
+        low_batt = st.batt_v < 10.5
+        if not low_batt or (int(time.time() * 2.5) % 2 == 0):
+            d.text_small(f"{st.batt_v:.1f}V", 88, 60)
     else:
         d.text_small("--", 88, 60)
 
