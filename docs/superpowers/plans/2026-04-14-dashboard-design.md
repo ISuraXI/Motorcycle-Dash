@@ -6,7 +6,9 @@
 
 **Architecture:** All changes are self-contained within the five `draw*Page()` functions and the `drawGCircle()` helper in `src/main.cpp`. No new files or data structures needed. The Python simulator (`simulator/oled_simulator.py`) is used to verify each page visually before committing.
 
-**Tech Stack:** C++/Arduino, Adafruit SSD1306 + GFX, FreeSansBold18pt7b font, PlatformIO, Python/pygame simulator.
+**Tech Stack:** C++/Arduino, Adafruit SSD1306 + GFX, **FreeSans18pt7b** font (not bold — cleaner strokes on OLED), PlatformIO, Python/pygame simulator.
+
+**Font decision:** Use `FreeSans18pt7b` (regular weight) instead of `FreeSansBold18pt7b` for all large numbers. Thinner strokes reduce visible pixel aliasing on the 128×64 monochrome display. The include at the top of `main.cpp` must be updated accordingly, and the helper `drawCenteredBigNumberWithDegree` must use `FreeSans18pt7b`.
 
 ---
 
@@ -665,3 +667,4 @@ git commit -m "fix: post-hardware-test tweaks to display layout"
 - [x] `sprint100State`, `sprint100StartMs`, `sprint100Result` all referenced from existing globals — ✓
 - [x] `drawBlitzerWarnerAliveIndicator()` removed from RACEBOX page (it's a side indicator not needed when Blitzer has its own row) — ✓
 - [x] `drawRpmRedlineBorder()` kept on all pages — ✓
+- [x] **Font:** `FreeSansBold18pt7b` replaced by `FreeSans18pt7b` everywhere — update `#include`, `drawCenteredBigNumberWithDegree`, and ENGINE page km/h block — ✓
