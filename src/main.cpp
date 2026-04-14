@@ -78,7 +78,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSans18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 
 #include "driver/twai.h"
@@ -147,7 +147,7 @@ float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text
 // #define TEST_MODE
 // When active: sensors cycle through normal range, warnings NOT triggered
 // Use TEST_MODE_WARNINGS to also test warning screens
-#define TEST_MODE_WARNINGS
+// #define TEST_MODE_WARNINGS
 
 // ---------------- one‑wire / outside temp ----------------
 #define ONE_WIRE_PIN 7
@@ -1433,7 +1433,7 @@ void drawCenteredBigNumberWithDegree(int value, int16_t baselineY)
 {
 	String s = String(value);
 
-	display.setFont(&FreeSansBold18pt7b);
+	display.setFont(&FreeSans18pt7b);
 
 	int16_t x1, y1;
 	uint16_t w, h;
@@ -1719,103 +1719,96 @@ static void drawBatteryTopRight()
 
 void drawOilPage(float oilC)
 {
-	display.clearDisplay();
-	display.setTextColor(SSD1306_WHITE);
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setFont();
+    display.setTextSize(1);
 
-	// outside temperature at fixed left margin, same vertical as battery
-	display.setFont();
-	display.setTextSize(1);
-	if (!isnan(outsideTemp))
-	{
-		display.setCursor(SIDE_MARGIN, 2);
-		display.print(outsideTemp, 1);
-		int16_t otDegX = display.getCursorX();
-		display.drawCircle(otDegX + 2, 1, 1, SSD1306_WHITE);
-		// ice warning: snowflake when at or below 0°C
-		if (outsideTemp <= 0.0f)
-			drawSnowflakeWarning(otDegX + 8, 5);
-	}
+    // "OIL" page label top-left
+    display.setCursor(2, 0);
+    display.print("OIL");
 
-	// coolant temperature (OBD2 PID 0x05) – bottom right, above oil bar
-	if (!isnan(coolantTempCached))
-	{
-		char cwBuf[8];
-		snprintf(cwBuf, sizeof(cwBuf), "%d", (int)round(coolantTempCached));
-		int16_t cx1, cy1; uint16_t cw, ch;
-		display.getTextBounds(cwBuf, 0, 0, &cx1, &cy1, &cw, &ch);
-		display.setCursor(SCREEN_WIDTH - (int16_t)cw - 6 - SIDE_MARGIN, 47);
-		display.print(cwBuf);
-		display.drawCircle(display.getCursorX() + 2, 46, 1, SSD1306_WHITE);
-	}
+    // Big oil temp centered, baseline y=44
+    if (isnan(oilC)) {
+        display.setFont(&FreeSans18pt7b);
+        const char* s = "--";
+        int16_t x1, y1; uint16_t w, h;
+        display.getTextBounds(s, 0, 44, &x1, &y1, &w, &h);
+        display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2, 44);
+        display.print(s);
+    } else {
+        drawCenteredBigNumberWithDegree((int)round(oilC), 44);
+    }
 
-	int16_t baselineY = 45;
-	if (isnan(oilC))
-	{
-		display.setFont(&FreeSansBold18pt7b);
-		String s = "--";
-		int16_t x1, y1;
-		uint16_t w, h;
-		display.getTextBounds(s, 0, baselineY, &x1, &y1, &w, &h);
-		int16_t x = (display.width() - (int16_t)w) / 2;
-		display.setCursor(x, baselineY);
-		display.print(s);
-		// debug: show reason below title, above bar
-		#if OIL_DEBUG
-		display.setFont();
-		display.setTextSize(1);
-		display.setCursor(0, 20);
-		if (!adsOk)
-			display.print("ADS:FAIL");
-		else if (isnan(dbgOilVoltage))
-			display.print("V:NaN");
-		else
-		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
-		#endif
-	}
-	else
-	{
-		drawCenteredBigNumberWithDegree((int)round(oilC), baselineY);
-		#if OIL_DEBUG
-		display.setFont();
-		display.setTextSize(1);
-		display.setCursor(0, 20);
-		if (!adsOk)
-			display.print("ADS:FAIL");
-		else if (isnan(dbgOilVoltage))
-			display.print("V:NaN");
-		else
-		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
-		#endif
-	}
+    display.setFont();
+    display.setTextSize(1);
 
-	display.setFont();
-	display.setTextSize(1);
+    // Horizontal divider + column separators
+    display.drawFastHLine(0, 50, SCREEN_WIDTH, SSD1306_WHITE);
+    display.drawFastVLine(42, 50, 14, SSD1306_WHITE);
+    display.drawFastVLine(85, 50, 14, SSD1306_WHITE);
 
-	// status text: COLD below range only
-	if (!isnan(oilC))
-	{
-		display.setCursor(2, 46);
-		if (oilC < 60.0f)
-			display.print("COLD");
-	}
+    // Col 1: Kühlwassertemperatur (OBD2)
+    display.setCursor(2, 52);
+    display.print("KWT");
+    display.setCursor(2, 60);
+    if (!isnan(coolantTempCached)) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", (int)round(coolantTempCached));
+        display.print(buf);
+        int16_t dx = display.getCursorX();
+        display.drawCircle(dx + 2, 59, 1, SSD1306_WHITE);
+        display.setCursor(dx + 5, 60);
+        display.print("C");
+    } else {
+        display.print("--");
+    }
 
-	drawBatteryTopRight();
+    // Col 2: Außentemperatur (DS18B20)
+    display.setCursor(46, 52);
+    display.print("AUSSEN");
+    display.setCursor(46, 60);
+    if (!isnan(outsideTemp)) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%.0f", outsideTemp);
+        display.print(buf);
+        int16_t dx = display.getCursorX();
+        display.drawCircle(dx + 2, 59, 1, SSD1306_WHITE);
+        display.setCursor(dx + 5, 60);
+        display.print("C");
+        if (outsideTemp <= 0.0f)
+            drawSnowflakeWarning(dx + 14, 62);
+    } else {
+        display.print("--");
+    }
 
-	drawOilBar(oilC);
-	drawBlitzerWarnerAliveIndicator();
+    // Col 3: Batteriespannung
+    display.setCursor(88, 52);
+    display.print("BATT");
+    display.setCursor(88, 60);
+    if (!isnan(battVoltageCached) && battVoltageCached >= 1.0f) {
+        bool lowBatt = battVoltageCached < BATT_LOW_V;
+        if (!lowBatt || ((millis() / 400) % 2) == 0) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%.1fV", battVoltageCached);
+            display.print(buf);
+        }
+    } else {
+        display.print("--");
+    }
 
-	// hold-progress bar: grows left→right while button held, shows 5s entry progress
-	if (btn.pressed)
-	{
-		unsigned long held = millis() - btn.pressStartMs;
-		int barW = (int)((float)held / (float)SETTINGS_OPEN_MS * 126.0f);
-		if (barW > 126) barW = 126;
-		if (barW > 0)
-			display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
-	}
+    // Settings hold-progress bar (grows while button held)
+    if (btn.pressed) {
+        unsigned long held = millis() - btn.pressStartMs;
+        int barW = (int)((float)held / (float)SETTINGS_OPEN_MS * 126.0f);
+        if (barW > 126) barW = 126;
+        if (barW > 0)
+            display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
+    }
 
-	drawRpmRedlineBorder();
-	display.display();
+    drawBlitzerWarnerAliveIndicator();
+    drawRpmRedlineBorder();
+    display.display();
 }
 
 // =========================================================
@@ -2021,7 +2014,7 @@ void drawEnginePage()
 
 	// ---- km/h – big number top center ----
 	{
-		display.setFont(&FreeSansBold18pt7b);
+		display.setFont(&FreeSans18pt7b);
 		char kmhBuf[8];
 		if (!isnan(vehicleSpeedCached))
 			snprintf(kmhBuf, sizeof(kmhBuf), "%d", (int)round(vehicleSpeedCached));
@@ -2567,7 +2560,7 @@ void showReadyScreen()
 	const char *txt = "READY";
 
 	// measure text with 18pt font
-	display.setFont(&FreeSansBold18pt7b);
+	display.setFont(&FreeSans18pt7b);
 	display.setTextSize(1);
 	int16_t x1, y1;
 	uint16_t tw, th;
@@ -2587,7 +2580,7 @@ void showReadyScreen()
 
 		display.clearDisplay();
 		display.setTextColor(SSD1306_WHITE);
-		display.setFont(&FreeSansBold18pt7b);
+		display.setFont(&FreeSans18pt7b);
 		display.setCursor(cx, cy);
 		display.print(txt);
 
@@ -2858,7 +2851,7 @@ void loop()
 			if (flashOn)
 				display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
 			display.setTextColor(flashOn ? SSD1306_BLACK : SSD1306_WHITE);
-			display.setFont(&FreeSansBold18pt7b);
+			display.setFont(&FreeSans18pt7b);
 			display.setCursor(4, 44);
 			display.print("BLITZ!");
 			display.setFont();
@@ -2872,7 +2865,7 @@ void loop()
 			if (flashOn)
 				display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
 			display.setTextColor(flashOn ? SSD1306_BLACK : SSD1306_WHITE);
-			display.setFont(&FreeSansBold18pt7b);
+			display.setFont(&FreeSans18pt7b);
 			{
 				const char* hotTxt = "OIL";
 				int16_t tx1, ty1; uint16_t tw, th;
@@ -2896,7 +2889,7 @@ void loop()
 			if (flashOn)
 				display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
 			display.setTextColor(flashOn ? SSD1306_BLACK : SSD1306_WHITE);
-			display.setFont(&FreeSansBold18pt7b);
+			display.setFont(&FreeSans18pt7b);
 			{
 				const char* hotTxt = "WATER";
 				int16_t tx1, ty1; uint16_t tw, th;
