@@ -2222,74 +2222,89 @@ void drawRaceBoxPage()
 
 	const int BX = 50, BW = 32; // Badge x und Breite
 
-	// BLE  (row 1)
-	display.drawBitmap(0, 10, icon_bt, 12, 12, SSD1306_WHITE);
-	display.setCursor(14, 12);
-	display.print("BLE");
-	{
-		bool bleAlive = raceboxBleAliveLastMs > 0 && (millis() - raceboxBleAliveLastMs) < RACEBOX_BLE_ALIVE_TIMEOUT_MS;
+	bool bleAlive = raceboxBleAliveLastMs > 0 && (millis() - raceboxBleAliveLastMs) < RACEBOX_BLE_ALIVE_TIMEOUT_MS;
+	bool raceboxOn = raceboxBle || bleAlive;
+
+	// BLT-Status Hilfslambda (gemeinsam für beide Zustände)
+	auto drawBlt = [&](int iconY, int textY, int badgeY, int badgeFillY) {
+		display.drawBitmap(0, iconY, icon_blitz, 12, 12, SSD1306_WHITE);
+		display.setCursor(14, textY);
+		display.print("BLT");
+		bool alive = blitzerAliveReceived && (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
+		if (blitzerAliveReceived && alive) {
+			display.fillRoundRect(BX, badgeY, BW, 12, 3, SSD1306_WHITE);
+			display.setTextColor(SSD1306_BLACK);
+			printCentered(BX, BW, badgeFillY, "ON");
+			display.setTextColor(SSD1306_WHITE);
+		} else if (blitzerAliveReceived && !alive) {
+			if (((millis() / 400) % 2) == 0)
+				display.drawRoundRect(BX, badgeY, BW, 12, 3, SSD1306_WHITE);
+			printCentered(BX, BW, badgeFillY, "OFF");
+		} else {
+			display.drawRoundRect(BX, badgeY, BW, 12, 3, SSD1306_WHITE);
+			printCentered(BX, BW, badgeFillY, "OFF");
+		}
+	};
+
+	if (!raceboxOn) {
+		// RaceBox ist aus: nur "RaceBox OFF" und BLT anzeigen (vertikal zentriert)
+
+		// Zeile 1: RaceBox OFF
+		display.setCursor(0, 20);
+		display.print("RaceBox");
+		display.drawRoundRect(BX, 18, BW, 12, 3, SSD1306_WHITE);
+		printCentered(BX, BW, 21, "OFF");
+
+		// Zeile 2 (y=38): BLT
+		drawBlt(38, 40, 39, 42);
+
+	} else {
+		// RaceBox ist an: BLE, REC, GPS und BLT anzeigen
+
+		// BLE  (row 1)
+		display.drawBitmap(0, 10, icon_bt, 12, 12, SSD1306_WHITE);
+		display.setCursor(14, 12);
+		display.print("BLE");
 		if (raceboxBle) {
 			display.fillRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
 			printCentered(BX, BW, 12, "CONN");
 			display.setTextColor(SSD1306_WHITE);
-		} else if (bleAlive) {
-			// RaceBox ist an, aber kein Phone verbunden
+		} else {
 			display.drawRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
 			printCentered(BX, BW, 12, "ON");
-		} else {
-			display.drawRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
-			printCentered(BX, BW, 12, "---");
 		}
-	}
 
-	// REC  (row 2)
-	display.drawBitmap(0, 23, icon_rec, 12, 12, SSD1306_WHITE);
-	display.setCursor(14, 25);
-	display.print("REC");
-	if (raceboxRec) {
-		display.fillRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
-		display.setTextColor(SSD1306_BLACK);
-		printCentered(BX, BW, 25, "REC");
-		display.setTextColor(SSD1306_WHITE);
-	} else {
-		display.drawRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
-		printCentered(BX, BW, 25, "---");
-	}
-
-	// GPS  (row 3)
-	display.drawBitmap(0, 36, icon_gps, 12, 12, SSD1306_WHITE);
-	display.setCursor(14, 38);
-	display.print("GPS");
-	if (raceboxGps) {
-		display.fillRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
-		display.setTextColor(SSD1306_BLACK);
-		printCentered(BX, BW, 38, "FIX");
-		display.setTextColor(SSD1306_WHITE);
-	} else {
-		display.drawRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
-		printCentered(BX, BW, 38, "---");
-	}
-
-	// Blitzer Warner alive  (row 4)
-	display.drawBitmap(0, 49, icon_blitz, 12, 12, SSD1306_WHITE);
-	display.setCursor(14, 51);
-	display.print("BLT");
-	{
-		bool alive = blitzerAliveReceived && (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
-		if (blitzerAliveReceived && alive) {
-			display.fillRoundRect(BX, 50, BW, 10, 3, SSD1306_WHITE);
+		// REC  (row 2)
+		display.drawBitmap(0, 23, icon_rec, 12, 12, SSD1306_WHITE);
+		display.setCursor(14, 25);
+		display.print("REC");
+		if (raceboxRec) {
+			display.fillRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
-			printCentered(BX, BW, 51, "ON");
+			printCentered(BX, BW, 25, "REC");
 			display.setTextColor(SSD1306_WHITE);
-		} else if (blitzerAliveReceived && !alive) {
-			if (((millis() / 400) % 2) == 0)
-				display.drawRoundRect(BX, 50, BW, 10, 3, SSD1306_WHITE);
-			printCentered(BX, BW, 51, "OFF");
 		} else {
-			display.drawRoundRect(BX, 50, BW, 10, 3, SSD1306_WHITE);
-			printCentered(BX, BW, 51, "???");
+			display.drawRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
+			printCentered(BX, BW, 25, "---");
 		}
+
+		// GPS  (row 3)
+		display.drawBitmap(0, 36, icon_gps, 12, 12, SSD1306_WHITE);
+		display.setCursor(14, 38);
+		display.print("GPS");
+		if (raceboxGps) {
+			display.fillRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
+			display.setTextColor(SSD1306_BLACK);
+			printCentered(BX, BW, 38, "FIX");
+			display.setTextColor(SSD1306_WHITE);
+		} else {
+			display.drawRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
+			printCentered(BX, BW, 38, "---");
+		}
+
+		// BLT  (row 4)
+		drawBlt(49, 51, 50, 53);
 	}
 
 	// Schaltflächen-Indikator oben rechts
