@@ -376,10 +376,10 @@ unsigned long resetAnimUntilMs = 0;
 
 enum SettingsItem : uint8_t {
 	SET_BRIGHTNESS = 0,   // brightness mode: 0=Auto, 1=Tag, 2=Nacht
-	SET_PITCH_OFFSET,     // sensor pitch correction for G-force
-	SET_LEAN_FLIP,        // invert lean angle direction
 	SET_NIGHT_SLEEP,      // turn display off (button wakes)
-	SET_RESET_ALL,        // reset all max values
+	SET_LEAN_FLIP,        // invert lean angle direction
+	SET_LEAN_OFFSET,      // capture current roll as lean zero offset
+	SET_PITCH_OFFSET,     // sensor pitch correction for G-force
 	SET_COUNT
 };
 
@@ -420,7 +420,8 @@ const float OIL_CRITICAL_C = 125.0f; // above this: full-screen warning overlay
 
 // ---------------- Lean ----------------
 float rollFiltered = 0.0f;
-float rollOffsetDeg = 0.0f; // always 0 unless calibrated this session
+const float ROLL_MOUNT_OFFSET_DEG = -3.0f; // fixed production mount error
+float rollOffsetDeg = 0.0f; // user lean offset from settings (EEPROM), default 0
 const float LEAN_ALPHA = 0.15f;
 
 float rollUi = 0.0f;
@@ -488,13 +489,14 @@ static uint8_t gQuadrant(float gx, float gy)
 #define EE_MAXLEAN_R_ADDR  7 // uint16_t deg – max right lean
 // Settings (stored as signed int8 or uint8)
 #define EE_SET_MAGIC     9  // uint8_t magic to detect first-ever settings save
-#define EE_SET_MAGIC_VAL 0x5E
+#define EE_SET_MAGIC_VAL 0x5F
 #define EE_SET_DS18_OFF  10  // int8_t  tenths of °C  (-30..+30 → -3.0..+3.0°C)
 #define EE_SET_BATT_LOW  11  // uint8_t tenths of V   (80..140  → 8.0..14.0V)
 #define EE_SET_G_DEAD    12  // uint8_t hundredths g  (0..20    → 0..0.20g)
 #define EE_SET_BRIGHT    14  // uint8_t 0=Auto 1=Tag 2=Nacht
 #define EE_SET_LEAN_FLIP 13  // uint8_t 0/1
 #define EE_SET_PITCH_OFF 15  // int8_t  degrees -20..+20
+#define EE_SET_ROLL_OFF  16  // int8_t  degrees -20..+20
 
 bool maxDirty = false;
 unsigned long lastEESaveMs = 0;
@@ -532,6 +534,7 @@ void updateGForce();
 void updateNightMode();
 
 void drawCenteredBigNumberWithDegree(int value, int16_t baselineY);
+void drawCenteredBigNumber(int value, int16_t baselineY);
 void drawCenteredTitleTiny(const char *text, int16_t baselineY);
 
 void drawLeanSemiGauge(float rollDeg);
@@ -554,7 +557,6 @@ void calibrateRollOffset();
 void showReadyScreen();
 
 // Progressive boot
-void drawCalIconTopRight(bool bnoOK, bool armed);
 static void drawSelfTestLineProgress(int y, const char *label, int8_t st);
 static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stAds, int8_t stEe, bool calArmed, float prog01);
 void bootProgressInitAndMaybeCalibrate();
@@ -683,9 +685,11 @@ bool loadMaxValues()
 			uint8_t eeFlip   = EEPROM.read(EE_SET_LEAN_FLIP);
 			uint8_t eeBright = EEPROM.read(EE_SET_BRIGHT);
 			int8_t  eePitch  = (int8_t)EEPROM.read(EE_SET_PITCH_OFF);
+			int8_t  eeRoll   = (int8_t)EEPROM.read(EE_SET_ROLL_OFF);
 			brightMode     = (eeBright <= 2) ? eeBright : 0;
 			leanFlip       = (eeFlip == 1);
 			pitchOffsetDeg = clampf((float)eePitch, -20.0f, 20.0f);
+			rollOffsetDeg  = clampf((float)eeRoll,  -20.0f, 20.0f);
 		}
 		// else: keep compile-time defaults (DS18B20_OFFSET=-1.2, BATT_LOW_V=10.5, G_DEADZONE=0.04)
 	}
@@ -743,6 +747,7 @@ void saveMaxValuesNow()
 	EEPROM.write(EE_SET_BRIGHT,    brightMode);
 	EEPROM.write(EE_SET_LEAN_FLIP, leanFlip ? 1 : 0);
 	EEPROM.write(EE_SET_PITCH_OFF, (uint8_t)(int8_t)lroundf(pitchOffsetDeg));
+	EEPROM.write(EE_SET_ROLL_OFF,  (uint8_t)(int8_t)lroundf(rollOffsetDeg));
 
 	EEPROM.commit();
 }
@@ -865,13 +870,9 @@ void buttonUpdate()
 						sleepCountdownActive = true;
 						sleepCountdownStartMs = now;
 						return;
-					case SET_RESET_ALL:
-						maxLeanSaved = 0.0f;
-						maxLeanLeft  = 0.0f;
-						maxLeanRight = 0.0f;
-						maxGSaved    = 0.0f;
-						memset(gQuadPeaks,   0, sizeof(gQuadPeaks));
-						memset(gQuadHasSlot, 0, sizeof(gQuadHasSlot));
+					case SET_LEAN_OFFSET:
+						// capture roll correction ON TOP of fixed -3° mount offset
+						rollOffsetDeg = clampf(bno085Roll - ROLL_MOUNT_OFFSET_DEG, -20.0f, 20.0f);
 						maxDirty = true;
 						break;
 					default: break;
@@ -1331,7 +1332,7 @@ void updateLean()
 		return;
 
 	pollBno085();
-	float roll = normalizeAngleDeg(bno085Roll - rollOffsetDeg) * (leanFlip ? -1.0f : 1.0f);
+	float roll = normalizeAngleDeg(bno085Roll - ROLL_MOUNT_OFFSET_DEG - rollOffsetDeg) * (leanFlip ? -1.0f : 1.0f);
 
 	static bool initDone = false;
 	if (!initDone)
@@ -1536,6 +1537,18 @@ void drawCenteredBigNumberWithDegree(int value, int16_t baselineY)
 		cy = 63 - r;
 
 	display.drawCircle(cx, cy, r, SSD1306_WHITE);
+}
+
+void drawCenteredBigNumber(int value, int16_t baselineY)
+{
+	String s = String(value);
+	display.setFont(&FreeSansBold18pt7b);
+	int16_t x1, y1;
+	uint16_t w, h;
+	display.getTextBounds(s, 0, baselineY, &x1, &y1, &w, &h);
+	int16_t x = (display.width() - (int16_t)w) / 2;
+	display.setCursor(x, baselineY);
+	display.print(s);
 }
 
 void drawCenteredTitleTiny(const char *text, int16_t baselineY)
@@ -1926,7 +1939,7 @@ void drawLeanPage()
 		centerValue = liveLean;
 	}
 
-	drawCenteredBigNumberWithDegree((int)round(centerValue), 28);
+	drawCenteredBigNumber((int)round(centerValue), 28);
 
 	display.setFont();
 	display.setTextSize(1);
@@ -2254,16 +2267,34 @@ void drawRaceBoxPage()
 	};
 
 	if (!raceboxOn) {
-		// RaceBox ist aus: nur "RaceBox OFF" und BLT anzeigen (vertikal zentriert)
+		// RaceBox ist aus: RaceBox + Co-Driver Status, Badges rechtsbündig ausgerichtet
+		const int OBX = 90, OBW = 32; // Badge-Spalte rechtsbündig
 
-		// Zeile 1: RaceBox OFF
-		display.setCursor(0, 20);
+		// Zeile 1: RaceBox
+		display.setCursor(6, 20);
 		display.print("RaceBox");
-		display.drawRoundRect(BX, 18, BW, 12, 3, SSD1306_WHITE);
-		printCentered(BX, BW, 21, "OFF");
+		display.drawRoundRect(OBX, 18, OBW, 12, 3, SSD1306_WHITE);
+		printCentered(OBX, OBW, 21, "OFF");
 
-		// Zeile 2 (y=38): BLT
-		drawBlt(38, 40, 39, 42);
+		// Zeile 2: Co-Driver
+		display.setCursor(6, 40);
+		display.print("Co-Driver");
+		{
+			bool alive = blitzerAliveReceived && (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
+			if (blitzerAliveReceived && alive) {
+				display.fillRoundRect(OBX, 38, OBW, 12, 3, SSD1306_WHITE);
+				display.setTextColor(SSD1306_BLACK);
+				printCentered(OBX, OBW, 41, "ON");
+				display.setTextColor(SSD1306_WHITE);
+			} else if (blitzerAliveReceived && !alive) {
+				if (((millis() / 400) % 2) == 0)
+					display.drawRoundRect(OBX, 38, OBW, 12, 3, SSD1306_WHITE);
+				printCentered(OBX, OBW, 41, "OFF");
+			} else {
+				display.drawRoundRect(OBX, 38, OBW, 12, 3, SSD1306_WHITE);
+				printCentered(OBX, OBW, 41, "OFF");
+			}
+		}
 
 	} else {
 		// RaceBox ist an: BLE, REC, GPS und BLT anzeigen
@@ -2349,11 +2380,11 @@ void drawSettingsPage()
 
 	// Items – 5 rows of 10px each starting at y=13
 	const char* labels[SET_COUNT] = {
-		"Helligkeit",
-		"Pitch Offset",
-		"Lean flip",
-		"Nacht-Modus",
-		"Alles loeschen"
+		"Brightness",
+		"Sleep Mode",
+		"Lean Flip",
+		"Lean Offset",
+		"Pitch Offset"
 	};
 
 	char valBuf[14];
@@ -2385,8 +2416,8 @@ void drawSettingsPage()
 			case SET_NIGHT_SLEEP:
 				snprintf(valBuf, sizeof(valBuf), "HOLD");
 				break;
-			case SET_RESET_ALL:
-				snprintf(valBuf, sizeof(valBuf), "HOLD");
+			case SET_LEAN_OFFSET:
+				snprintf(valBuf, sizeof(valBuf), "%+.0f Grad", rollOffsetDeg);
 				break;
 			default:
 				valBuf[0] = 0;
@@ -2462,45 +2493,6 @@ void calibrateRollOffset()
 // =========================================================
 // Progressive Boot UI
 // =========================================================
-void drawCalIconTopRight(bool bnoOK, bool armed)
-{
-	if (!bnoOK)
-		return;
-
-	const int16_t y = 6;
-	const int16_t x0 = 96;
-	const int16_t w = 32; 
-	const int16_t h = 10;
-
-	// clear whole area each frame
-	display.fillRect(x0, y - 1, w, h, SSD1306_BLACK);
-
-	// button circle
-	const int16_t cx = x0 + 6;
-	const int16_t cy = y + 2;
-	const int16_t r = 3;
-	display.drawCircle(cx, cy, r, SSD1306_WHITE);
-	display.fillCircle(cx, cy, 1, SSD1306_WHITE);
-
-	// CAL text
-	const int16_t tx = x0 + 12;
-
-	if (!armed)
-	{
-		display.setTextColor(SSD1306_WHITE);
-		display.setCursor(tx, y);
-		display.print("CAL");
-	}
-	else
-	{
-		display.fillRect(tx - 1, y - 1, 20, 9, SSD1306_WHITE);
-		display.setTextColor(SSD1306_BLACK);
-		display.setCursor(tx, y);
-		display.print("CAL");
-		display.setTextColor(SSD1306_WHITE);
-	}
-}
-
 // status: -1 = pending, 0 = fail, 1 = ok
 static void drawSelfTestLineProgress(int y, const char *label, int8_t st)
 {
@@ -2554,8 +2546,6 @@ static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stAds, int8_t s
 	drawSelfTestLineProgress(40, "ADS1115", stAds);
 	drawSelfTestLineProgress(50, "EEPROM",  stEe);
 
-	drawCalIconTopRight(stBno > 0, calArmed);
-
 	const int barX = 8, barY = 59, barW = 112, barH = 4;
 	display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
 	int fill = (int)((barW - 2) * clampf(prog01, 0.0f, 1.0f));
@@ -2602,7 +2592,6 @@ void bootProgressInitAndMaybeCalibrate()
 		bno.enableReport(SH2_LINEAR_ACCELERATION,  10000);  // 10ms = 100Hz
 		delay(100);
 	}
-	rollOffsetDeg = -3.00f;  // hardcoded mount offset (measured)
 	stBno = bnoOk ? 1 : 0;
 	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.6f);
 
@@ -2612,7 +2601,7 @@ void bootProgressInitAndMaybeCalibrate()
 		dsSensors.requestTemperaturesByAddress(outsideSensorAddr);
 	}
 
-	// wait 2s with hold-to-cal — bar fills from 0.6 → 1.0 during this time
+	// wait 2s — bar fills from 0.6 → 1.0
 	const unsigned long waitMs = 2000;
 	unsigned long t0 = millis();
 
@@ -2770,8 +2759,6 @@ void setup()
 	display.display();
 
 	oledSetContrast(CONTRAST_DAY);
-
-	rollOffsetDeg = -3.00f;  // hardcoded mount offset
 
 	bootProgressInitAndMaybeCalibrate();
 
