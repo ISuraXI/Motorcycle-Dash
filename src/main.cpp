@@ -1290,6 +1290,13 @@ void updateCurvePeakHold(float leanAbs)
 		}
 	}
 
+	// declineExpired: display already switched to live → prevent hold from firing on corner exit
+	if (cornerAboveThreshold && cornerDeclineStartMs != 0 &&
+	    (now - cornerDeclineStartMs >= HOLD_AFTER_CORNER_MS))
+	{
+		cornerAboveThreshold = false;
+	}
+
 	if (leanAbs <= CORNER_EXIT_DEG)
 	{
 		if (belowExitSinceMs == 0)
