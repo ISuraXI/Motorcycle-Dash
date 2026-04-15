@@ -211,7 +211,7 @@ const float BATT_CAL = 1.00833f;
 float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text) – runtime, saved in EEPROM
 
 // ---- Test mode: comment out to disable ----
-#define TEST_MODE
+// #define TEST_MODE
 // When active: sensors cycle through normal range, warnings NOT triggered
 // Use TEST_MODE_WARNINGS to also test warning screens
 // #define TEST_MODE_WARNINGS
