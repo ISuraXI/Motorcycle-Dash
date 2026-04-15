@@ -78,6 +78,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
+#include <U8g2_for_Adafruit_GFX.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 
@@ -104,6 +105,72 @@
 #define OLED_CS   10 // CS   -> GPIO 10
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, OLED_CS);
+
+// ---- U8g2-for-Adafruit-GFX: sharp fonts + icon renderer ----
+U8G2_FOR_ADAFRUIT_GFX u8g2fonts;
+
+// 8×8 PROGMEM status icons (MSB = leftmost pixel per row)
+// ---- 12×12 status icons (2 bytes per row, MSB left, bottom 4 bits of 2nd byte unused) ----
+// Bluetooth ᛒ  — vertical spine with upper+lower diagonal branches right
+static const uint8_t PROGMEM icon_bt[24] = {
+    0x08,0x00, // ....#...
+    0x0C,0x00, // ....##..
+    0x4A,0x00, // .#..#.#.
+    0x2C,0x00, // ..#.##..
+    0x18,0x00, // ...##...
+    0x18,0x00, // ...##...
+    0x2C,0x00, // ..#.##..
+    0x4A,0x00, // .#..#.#.
+    0x0C,0x00, // ....##..
+    0x08,0x00, // ....#...
+    0x00,0x00,
+    0x00,0x00,
+};
+// GPS location pin — solid outer ring, hollow circle, narrow stem + tip
+static const uint8_t PROGMEM icon_gps[24] = {
+    0x3C,0x00, // ..XXXX..  outer arc top
+    0x7E,0x00, // .XXXXXX.  solid
+    0x42,0x00, // .X....X.  ring (4px hollow)
+    0x42,0x00, // .X....X.
+    0x42,0x00, // .X....X.
+    0x7E,0x00, // .XXXXXX.  close ring
+    0x3C,0x00, // ..XXXX..  outer arc bottom
+    0x1C,0x00, // ...XXX..  stem
+    0x18,0x00, // ...XX...
+    0x08,0x00, // ....X...  tip
+    0x00,0x00,
+    0x00,0x00,
+};
+// REC — solid filled circle in center
+static const uint8_t PROGMEM icon_rec[24] = {
+    0x00,0x00,
+    0x1C,0x00, // ...###..
+    0x3E,0x00, // ..#####.
+    0x7F,0x00, // .#######
+    0x7F,0x00,
+    0x7F,0x00,
+    0x7F,0x00,
+    0x3E,0x00, // ..#####.
+    0x1C,0x00, // ...###..
+    0x00,0x00,
+    0x00,0x00,
+    0x00,0x00,
+};
+// Lightning bolt ⚡ — user pixel design
+static const uint8_t PROGMEM icon_blitz[24] = {
+    0x04,0x00, // .....#......
+    0x0C,0x00, // ....##......
+    0x1C,0x00, // ...###......
+    0x3C,0x00, // ..####......
+    0x7C,0x00, // .#####......
+    0x0F,0x80, // ....#####...  ← kink
+    0x0F,0x00, // ....####....
+    0x0E,0x00, // ....###.....
+    0x0C,0x00, // ....##......
+    0x08,0x00, // ....#.......
+    0x00,0x00,
+    0x00,0x00,
+};
 
 // ---------------- BNO085 ----------------
 Adafruit_BNO08x bno(-1);
@@ -144,10 +211,10 @@ const float BATT_CAL = 1.00833f;
 float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text) – runtime, saved in EEPROM
 
 // ---- Test mode: comment out to disable ----
-// #define TEST_MODE
+#define TEST_MODE
 // When active: sensors cycle through normal range, warnings NOT triggered
 // Use TEST_MODE_WARNINGS to also test warning screens
-#define TEST_MODE_WARNINGS
+// #define TEST_MODE_WARNINGS
 
 // ---------------- one‑wire / outside temp ----------------
 #define ONE_WIRE_PIN 7
@@ -1748,7 +1815,7 @@ void drawOilPage(float oilC)
 		display.drawCircle(display.getCursorX() + 2, 46, 1, SSD1306_WHITE);
 	}
 
-	int16_t baselineY = 45;
+	int16_t baselineY = 41;
 	if (isnan(oilC))
 	{
 		display.setFont(&FreeSansBold18pt7b);
@@ -2029,12 +2096,12 @@ void drawEnginePage()
 			snprintf(kmhBuf, sizeof(kmhBuf), "--");
 		int16_t x1, y1; uint16_t w, h;
 		display.getTextBounds(kmhBuf, 0, 0, &x1, &y1, &w, &h);
-		display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 26);
+		display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 30);
 		display.print(kmhBuf);
 		display.setFont();
 		// "km/h" label small, right of number
 		display.setTextSize(1);
-		display.setCursor((SCREEN_WIDTH + (int16_t)w) / 2 - x1 + 2, 15);
+		display.setCursor((SCREEN_WIDTH + (int16_t)w) / 2 - x1 + 6, 15);
 		display.print("km/h");
 	}
 
@@ -2156,7 +2223,8 @@ void drawRaceBoxPage()
 	const int BX = 50, BW = 32; // Badge x und Breite
 
 	// BLE  (row 1)
-	display.setCursor(8, 12);
+	display.drawBitmap(0, 10, icon_bt, 12, 12, SSD1306_WHITE);
+	display.setCursor(14, 12);
 	display.print("BLE");
 	{
 		bool bleAlive = raceboxBleAliveLastMs > 0 && (millis() - raceboxBleAliveLastMs) < RACEBOX_BLE_ALIVE_TIMEOUT_MS;
@@ -2176,7 +2244,8 @@ void drawRaceBoxPage()
 	}
 
 	// REC  (row 2)
-	display.setCursor(8, 25);
+	display.drawBitmap(0, 23, icon_rec, 12, 12, SSD1306_WHITE);
+	display.setCursor(14, 25);
 	display.print("REC");
 	if (raceboxRec) {
 		display.fillRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
@@ -2189,7 +2258,8 @@ void drawRaceBoxPage()
 	}
 
 	// GPS  (row 3)
-	display.setCursor(8, 38);
+	display.drawBitmap(0, 36, icon_gps, 12, 12, SSD1306_WHITE);
+	display.setCursor(14, 38);
 	display.print("GPS");
 	if (raceboxGps) {
 		display.fillRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
@@ -2202,7 +2272,8 @@ void drawRaceBoxPage()
 	}
 
 	// Blitzer Warner alive  (row 4)
-	display.setCursor(8, 51);
+	display.drawBitmap(0, 49, icon_blitz, 12, 12, SSD1306_WHITE);
+	display.setCursor(14, 51);
 	display.print("BLT");
 	{
 		bool alive = blitzerAliveReceived && (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
@@ -2234,6 +2305,9 @@ void drawRaceBoxPage()
 	display.display();
 }
 
+// =========================================================
+// Fonts showcase page
+// =========================================================
 // =========================================================
 // Settings UI helpers
 // =========================================================
