@@ -229,7 +229,9 @@ DeviceAddress outsideSensorAddr;
 bool ds18b20Found = false;
 
 float oilTempCached = NAN;
-const float OIL_EMA_ALPHA = 0.3f;
+// alpha=0.05 → Zeitkonstante ~6s (Kanal wird alle 300ms aktualisiert: 300ms/0.05=6s)
+// Öl ändert sich physikalisch in Sekunden kaum → starke Dämpfung sinnvoll
+const float OIL_EMA_ALPHA = 0.05f;
 float dbgOilVoltage = NAN;  // last raw ADS voltage (debug)
 
 float coolantTempCached = NAN; // OBD2 PID 0x05 – Kühlwassertemperatur via CAN
@@ -255,6 +257,7 @@ float DS18B20_OFFSET = -1.2f;
 
 float battVoltageCached = NAN;
 const float BATT_EMA_ALPHA = 0.3f;
+const float BATT_SPIKE_REJECT_V = 0.25f; // ignore single-sample spikes >0.25V
 
 // round-robin ADS1115 scheduling: one read per loop, rotate channels
 // slot 0 = oil (ADS ch0), slot 1 = Blitzer alive (ADS ch1), slot 2 = battery (ADS ch2)
@@ -1196,9 +1199,13 @@ void updateAdsReadings()
 		return;
 	lastAdsReadMs = now;
 
+	// During BLITZ the OLED draws full-white → 3.3V rail dips → NTC divider reads wrong.
+	// Freeze oil + battery updates for the duration; channel 1 (blitzer alive) still runs.
+	bool blitzerDisplayActive = (now < blitzerActiveUntilMs);
+
 	if (adsNextChannel == 0)
 	{
-		updateOilTemp();
+		if (!blitzerDisplayActive) updateOilTemp();
 		adsNextChannel = 1;
 	}
 	else if (adsNextChannel == 1)
@@ -1221,7 +1228,7 @@ void updateAdsReadings()
 			battNanSinceMs = 0;
 			if (isnan(battVoltageCached))
 				battVoltageCached = v;
-			else
+			else if (!blitzerDisplayActive && fabsf(v - battVoltageCached) < BATT_SPIKE_REJECT_V)
 				battVoltageCached += BATT_EMA_ALPHA * (v - battVoltageCached);
 		}
 		else
@@ -1885,7 +1892,15 @@ void drawOilPage(float oilC)
 	}
 	else
 	{
-		drawCenteredBigNumberWithDegree((int)round(oilC), baselineY);
+		// Hysteresis: step ±1 only when float moves >0.6°C past current integer → never skips a digit
+		static int shownOilInt = INT_MIN;
+		if (shownOilInt == INT_MIN)
+			shownOilInt = (int)round(oilC);
+		else if (oilC > (float)shownOilInt + 0.6f)
+			shownOilInt++;
+		else if (oilC < (float)shownOilInt - 0.6f)
+			shownOilInt--;
+		drawCenteredBigNumberWithDegree(shownOilInt, baselineY);
 		#if OIL_DEBUG
 		display.setFont();
 		display.setTextSize(1);
@@ -2598,13 +2613,8 @@ void bootProgressInitAndMaybeCalibrate()
 	stAds = adsOk ? 1 : 0;
 	if (adsOk) {
 		ads.setGain(ADS_GAIN);
-		delay(5);  // let ADS settle after gain change
-		// pre-fill oil temp: retry up to 5× so first frame always shows a reading
-		for (int attempt = 0; attempt < 5 && isnan(oilTempCached); attempt++) {
-			float t = readOilTempOnce();
-			if (!isnan(t)) oilTempCached = t;
-			else delay(20);
-		}
+		delay(10);  // let ADS settle after gain change
+		// oilTempCached stays NAN → updateOilTemp() handles 8-sample warm-up on first call
 	}
 	renderBootProgress(stBno, stBh, stAds, stEe, false, 0.45f);
 
