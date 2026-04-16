@@ -229,7 +229,7 @@ DeviceAddress outsideSensorAddr;
 bool ds18b20Found = false;
 
 float oilTempCached = NAN;
-const float OIL_EMA_ALPHA = 0.5f;
+const float OIL_EMA_ALPHA = 0.3f;
 float dbgOilVoltage = NAN;  // last raw ADS voltage (debug)
 
 float coolantTempCached = NAN; // OBD2 PID 0x05 – Kühlwassertemperatur via CAN
@@ -254,7 +254,7 @@ float sprint100Result = NAN;
 float DS18B20_OFFSET = -1.2f;
 
 float battVoltageCached = NAN;
-const float BATT_EMA_ALPHA = 0.5f;
+const float BATT_EMA_ALPHA = 0.3f;
 
 // round-robin ADS1115 scheduling: one read per loop, rotate channels
 // slot 0 = oil (ADS ch0), slot 1 = Blitzer alive (ADS ch1), slot 2 = battery (ADS ch2)
@@ -940,11 +940,24 @@ void buttonUpdate()
 // =========================================================
 // Oil temp
 // =========================================================
+
+// Median-of-3: one bad I2C read out of three is automatically rejected
+static int16_t medianOf3(int16_t a, int16_t b, int16_t c)
+{
+	if (a > b) { int16_t t = a; a = b; b = t; }
+	if (b > c) { int16_t t = b; b = c; c = t; }
+	if (a > b) { int16_t t = a; a = b; b = t; }
+	return b;
+}
+
 float readAdsVoltage(int ch)
 {
 	if (!adsOk)
 		return NAN;
-	int16_t raw = ads.readADC_SingleEnded(ch);
+	int16_t r0 = ads.readADC_SingleEnded(ch);
+	int16_t r1 = ads.readADC_SingleEnded(ch);
+	int16_t r2 = ads.readADC_SingleEnded(ch);
+	int16_t raw = medianOf3(r0, r1, r2);
 	if (raw < 0)
 		return NAN;
 	return raw * ADS_SCALE;
@@ -1167,7 +1180,10 @@ float readBatteryVoltage()
 	if (isnan(v))
 		return NAN;
 	// correct divider + calibration
-	return v * (BATT_R_TOP + BATT_R_BOT) / BATT_R_BOT * BATT_CAL;
+	float batt = v * (BATT_R_TOP + BATT_R_BOT) / BATT_R_BOT * BATT_CAL;
+	if (batt < 5.0f)   // below 5V → floating/disconnected, treat as no source
+		return NAN;
+	return batt;
 }
 
 // updateAdsReadings: one ADS1115 read per call, rotating through 3 channels
@@ -1198,13 +1214,21 @@ void updateAdsReadings()
 	}
 	else
 	{
+		static unsigned long battNanSinceMs = 0;
 		float v = readBatteryVoltage();
 		if (!isnan(v))
 		{
+			battNanSinceMs = 0;
 			if (isnan(battVoltageCached))
 				battVoltageCached = v;
 			else
 				battVoltageCached += BATT_EMA_ALPHA * (v - battVoltageCached);
+		}
+		else
+		{
+			// source disconnected/floating → clear after 3s of NAN readings
+			if (battNanSinceMs == 0) battNanSinceMs = now;
+			if (now - battNanSinceMs > 3000) battVoltageCached = NAN;
 		}
 		adsNextChannel = 0;
 	}
