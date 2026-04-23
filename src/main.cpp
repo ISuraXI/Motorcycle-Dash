@@ -68,7 +68,10 @@
 #include <EEPROM.h>
 
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_SH110X.h>
+// Compatibility aliases so all SSD1306_WHITE / SSD1306_BLACK references keep working
+#define SSD1306_WHITE SH110X_WHITE
+#define SSD1306_BLACK SH110X_BLACK
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO08x.h>
 
@@ -104,7 +107,7 @@
 #define OLED_RST   6 // RST  -> GPIO 6
 #define OLED_CS   10 // CS   -> GPIO 10
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, OLED_CS);
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, OLED_CS);
 
 // ---- U8g2-for-Adafruit-GFX: sharp fonts + icon renderer ----
 U8G2_FOR_ADAFRUIT_GFX u8g2fonts;
@@ -649,8 +652,8 @@ static int mapf_to_i(float v, float inMin, float inMax, int outMin, int outMax)
 }
 static void oledSetContrast(uint8_t c)
 {
-	display.ssd1306_command(SSD1306_SETCONTRAST);
-	display.ssd1306_command(c);
+	display.oled_command(0x81); // SH110X_SETCONTRAST
+	display.oled_command(c);
 }
 
 // =========================================================
@@ -790,7 +793,7 @@ void buttonUpdate()
 			// Wake display if sleeping – consume this press
 			if (displaySleeping)
 			{
-				display.ssd1306_command(SSD1306_DISPLAYON);
+				display.oled_command(0xAF); // SH110X_DISPLAYON
 				displaySleeping = false;
 				sleepCountdownActive = false;
 				btn.longFired = true; // suppress any page change on release
@@ -2782,7 +2785,7 @@ void setup()
 	// otherwise specify sck, miso, mosi, ss
 	SPI.begin(OLED_CLK, /*MISO*/ -1, OLED_MOSI, OLED_CS);
 
-	if (!display.begin(SSD1306_SWITCHCAPVCC))
+	if (!display.begin())
 	{
 		while (true) { delay(100); }
 	}
@@ -2956,7 +2959,7 @@ void loop()
 		{
 			sleepCountdownActive = false;
 			displaySleeping = true;
-			display.ssd1306_command(SSD1306_DISPLAYOFF);
+			display.oled_command(0xAE); // SH110X_DISPLAYOFF
 		}
 
 		// settings overlay takes priority over everything except blitzer
