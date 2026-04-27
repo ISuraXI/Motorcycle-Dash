@@ -78,8 +78,8 @@ Long press on any secondary page → back to primary group
 | Page | Content | Long-press action |
 |---|---|---|
 | OIL | Oil temp (°C), coolant temp (OBD2), outside temp, battery voltage | Open settings (hold 5 s) |
-| LEAN | Current lean angle, corner peak hold, all-time max L/R; CAN-offline badge top-right when OBD2 speed unavailable | Enter secondary group (800 ms) |
-| G | Current & all-time max G-force, quadrant peaks | Enter primary group (800 ms) |
+| LEAN | Current lean angle, corner peak hold, all-time max L/R; CAN-offline badge top-right when OBD2 speed unavailable | Enter secondary group (800 ms); **2,5 s halten → L/R-Max zurücksetzen** |
+| G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Enter primary group (800 ms) |
 | ENGINE | RPM, coolant, load, throttle, speed, 0–100 km/h timer | Enter primary group (800 ms) |
 | RACEBOX | GPS fix / BLE / recording status, auto-start recording | Enter primary group (800 ms) |
 
@@ -95,6 +95,11 @@ Short press navigates items (scrolling list). Long press (600 ms) changes value.
 | Lean Offset | Capture current roll as zero reference |
 | Pitch Offset | Capture current pitch as G-force correction |
 | Reset Lean | Reset all-time lean max L/R (EEPROM) |
+| Temp Offset | DS18B20-Kalibrierung ±3 °C (Schritte 0,5 °C) |
+| Batt Warnung | Warnschwelle 8,0–14,0 V (Schritte 0,5 V) |
+| G Deadzone | Vibrations-Unterdrückung 0,00–0,20 g (Schritte 0,01 g) |
+
+**Header der Einstellungsseite:** Links = ESP32-Temperatur (°C) · Mitte = SETTINGS · Rechts = freier RAM (%)
 
 **Brightness modes:**
 - **Auto** — BH1750 adjusts contrast between 0x35 (night) and 0xFF (day)
