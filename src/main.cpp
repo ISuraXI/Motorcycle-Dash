@@ -496,6 +496,8 @@ float G_DEADZONE            = 0.04f;   // Motorvibrationen < 0.04g werden ignori
 float pitchOffsetDeg        = 0.0f;    // sensor pitch correction in degrees (saved in EEPROM)
 
 float maxGSaved = 0.0f;
+float maxGBrake = 0.0f;   // session peak braking G (positive value)
+float maxGAccel = 0.0f;   // session peak acceleration G (positive value)
 
 // 4 Quadranten × 2 stärkste Peaks (RAM-only, weg beim Neustart)
 // Quadrant: 0=rechts/vorne (+x/+y), 1=links/vorne (-x/+y),
@@ -741,6 +743,8 @@ bool loadMaxValues()
 	{
 		maxLeanSaved = 0.0f;
 		maxGSaved = 0.0f;
+		maxGBrake = 0.0f;
+		maxGAccel = 0.0f;
 	}
 
 	// clamp to sane ranges (guard against uninitialized / corrupt EEPROM)
@@ -1674,6 +1678,9 @@ void updateGForce()
 		maxGSaved = mag;
 		maxDirty = true;
 	}
+	// Brake / accel peak (longitudinal axis only)
+	if (gXFast < 0.0f && -gXFast > maxGBrake) maxGBrake = -gXFast;
+	if (gXFast > 0.0f &&  gXFast > maxGAccel) maxGAccel =  gXFast;
 	// Quadranten-Peak-Puffer aktualisieren
 	{
 		uint8_t q = gQuadrant(gXFast, gYFast);
@@ -2372,10 +2379,59 @@ void drawGPage()
 {
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
+	display.setFont();
+	display.setTextSize(1);
 
-	drawGCircle(gX, gY, maxGSaved);
+	// ---- Header labels ----
+	display.setCursor(2, 1);
+	display.print("< BREMSEN");
+	display.setCursor(84, 1);
+	display.print("GAS >");
 
-	// reset flash
+	// ---- Large current G value ----
+	char gBuf[8];
+	snprintf(gBuf, sizeof(gBuf), "%.2fg", fabsf(gX));
+	display.setFont(&FreeSansBold18pt7b);
+	int16_t bx, by; uint16_t bw, bh;
+	display.getTextBounds(gBuf, 0, 0, &bx, &by, &bw, &bh);
+	display.setCursor((SCREEN_WIDTH - (int16_t)bw) / 2 - bx, 36);
+	display.print(gBuf);
+	display.setFont();
+	display.setTextSize(1);
+
+	// ---- Horizontal bar (y=42, h=8) ----
+	// range ±1.5g, centre at x=64, usable half-width = 58px
+	const int16_t BAR_Y  = 42;
+	const int16_t BAR_H  = 8;
+	const int16_t BAR_CX = 64;
+	const float   BAR_G  = 1.5f;
+	const int16_t BAR_HW = 58; // half-width in pixels
+	display.drawRect(BAR_CX - BAR_HW, BAR_Y, BAR_HW * 2, BAR_H, SSD1306_WHITE);
+	display.drawFastVLine(BAR_CX, BAR_Y, BAR_H, SSD1306_WHITE); // centre tick
+	// fill
+	if (fabsf(gX) > 0.01f)
+	{
+		int16_t fillW = (int16_t)((fabsf(gX) / BAR_G) * (float)BAR_HW);
+		if (fillW > BAR_HW) fillW = BAR_HW;
+		if (fillW > 0)
+		{
+			if (gX < 0.0f) // braking: fill left from centre
+				display.fillRect(BAR_CX - fillW, BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
+			else            // accel: fill right from centre
+				display.fillRect(BAR_CX + 1,     BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
+		}
+	}
+
+	// ---- Peak values ----
+	char pbuf[10];
+	snprintf(pbuf, sizeof(pbuf), "M:%.2fg", maxGBrake);
+	display.setCursor(2, 54);
+	display.print(pbuf);
+	snprintf(pbuf, sizeof(pbuf), "M:%.2fg", maxGAccel);
+	display.setCursor(128 - (int16_t)(strlen(pbuf) * 6) - 2, 54);
+	display.print(pbuf);
+
+	// ---- reset flash ----
 	unsigned long now = millis();
 	if (now < resetAnimUntilMs)
 	{
