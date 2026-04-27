@@ -8,7 +8,7 @@
     SDA  = GPIO 8
     SCL  = GPIO 9
 
-  OLED 1.51" Transparent (SSD1309 / SSD1306) 128×64 – SPI2
+  OLED 1.54" (SD1309 / SSD1306-kompatibel) 128×64 – SPI2
     DIN/MOSI = GPIO 11  (SPI2_MOSI)
     CLK/SCK  = GPIO 12  (SPI2_SCK)
     CS       = GPIO 10
@@ -52,10 +52,14 @@
   OIL_PIN (legacy NTC direct-ADC fallback, not actively used)
     GPIO 1   ← oil temp is read via ADS1115 channel 0
 
-  Pages (short press cycles): OIL -> LEAN -> G -> RACEBOX -> OIL ...
-  Long press:
-   - LEAN : resets all-time max (EEPROM)
-   - G    : resets all-time max (EEPROM)
+  Pages:
+  Primary group  (short press cycles OIL ↔ LEAN):
+   - Short press : cycle OIL → LEAN → OIL
+   - Long press  : LEAN 800ms → enter secondary group
+                   OIL  5s   → settings / calibrate
+  Secondary group (short press cycles G → ENGINE → RACEBOX):
+   - Short press : cycle G → ENGINE → RACEBOX → G
+   - Long press 800ms on any secondary page → back to primary group
 
   Boot:
    - Screen shows immediately, sensors flip from "..." to OK/FAIL as they init
@@ -180,6 +184,13 @@ float bno085Pitch  = 0.0f;  // forward/backward tilt of sensor in degrees
 float bno085LinX   = 0.0f;
 float bno085LinY   = 0.0f;
 float bno085LinZ   = 0.0f;
+float bno085GyroX  = 0.0f;  // calibrated gyro in rad/s (sensor frame)
+float bno085GyroY  = 0.0f;
+float bno085GyroZ  = 0.0f;
+float bno085Qi     = 0.0f;  // last ARVR_STABILIZED_GRV quaternion components
+float bno085Qj     = 0.0f;  // needed to compute earth-frame yaw rate
+float bno085Qk     = 0.0f;
+float bno085Qr     = 1.0f;
 
 // ---------------- BH1750 ----------------
 BH1750 lightMeter;
@@ -278,6 +289,13 @@ const bool ENABLE_ULTRADARK_INVERT = false;
 const float LUX_INVERT_ON = 3.0f;
 const float LUX_INVERT_OFF = 6.0f;
 
+// Sun-invert mode: in direct sunlight the OLED reflection washes out the dark
+// background. Inverting to white-bg/black-text means the reflection blends into
+// the bright background while the (non-emitting) black pixels stay dark → readable.
+const float LUX_SUN_INVERT_ON  = 8000.0f;  // ~bright overcast/sun → invert
+const float LUX_SUN_INVERT_OFF = 4000.0f;  // hysteresis: revert when clearly shaded
+bool sunInverted = false;
+
 float luxFiltered = 50.0f;
 float contrastF = (float)CONTRAST_DAY;
 bool displayInverted = false;
@@ -354,6 +372,11 @@ unsigned long raceboxBleAliveLastMs = 0;   // last time BLE pin was LOW after Pi
 #define RACEBOX_BLE_ALIVE_TIMEOUT_MS 10000 // show "ON" for 10s after last blink
 Page page = PAGE_OIL;
 
+// Two-group navigation: primary (OIL/LEAN) and secondary (G/ENGINE/RACEBOX)
+bool primaryGroup       = true;       // true = in primary group
+Page lastPrimaryPage    = PAGE_OIL;   // remembered when leaving primary
+Page lastSecondaryPage  = PAGE_G;     // remembered when leaving secondary
+
 #define BTN_PIN  4
 #define DEBOUNCE_MS 15
 #define LONGPRESS_MS 800
@@ -383,10 +406,14 @@ enum SettingsItem : uint8_t {
 	SET_LEAN_FLIP,        // invert lean angle direction
 	SET_LEAN_OFFSET,      // capture current roll as lean zero offset
 	SET_PITCH_OFFSET,     // sensor pitch correction for G-force
+	SET_RESET_LEAN,       // reset all-time lean max L/R (moved from long press on LEAN)
+	SET_DS18_OFFSET,      // DS18B20 temperature calibration offset
+	SET_BATT_LOW,         // battery low warning threshold
+	SET_G_DEADZONE,       // G-force vibration deadzone
 	SET_COUNT
 };
 
-// Brightness mode: 0=Auto (BH1750), 1=Tag (always max), 2=Nacht (always min)
+// Brightness mode: 0=Auto (BH1750), 1=Tag (always max), 2=Nacht (always min), 3=Sonne (forced invert)
 uint8_t brightMode = 0;
 bool leanFlip = false;  // true = invert roll direction (sensor mounted mirrored)
 
@@ -394,6 +421,7 @@ bool settingsOpen = false;
 uint8_t settingsIdx = 0;
 unsigned long settingsLastActMs = 0; // last interaction time (for timeout)
 bool settingsLongFired = false;    // long-press-in-settings already fired
+bool leanResetFired    = false;    // 2.5 s hold on LEAN page → reset L/R max
 unsigned long settingsPressStartMs = 0;
 bool settingsEnterReleasePending = false; // ignore first release after entering settings
 
@@ -425,10 +453,12 @@ const float OIL_CRITICAL_C = 125.0f; // above this: full-screen warning overlay
 float rollFiltered = 0.0f;
 const float ROLL_MOUNT_OFFSET_DEG = -3.0f; // fixed production mount error
 float rollOffsetDeg = 0.0f; // user lean offset from settings (EEPROM), default 0
-const float LEAN_ALPHA = 0.15f;
+// Time constants in seconds (replaces sample-based alphas so behaviour is
+// independent of BNO085 event rate / I2C load)
+const float LEAN_TAU_S    = 0.06f;  // sensor filter τ  (~60 ms, same feel as old α=0.15 at 100Hz)
+const float LEAN_UI_TAU_S = 0.08f;  // display filter τ  (~80 ms, same feel as old α=0.25 at 100Hz)
 
 float rollUi = 0.0f;
-const float LEAN_UI_ALPHA = 0.25f;
 
 const float LEAN_DEADZONE_DEG = 2.0f;
 
@@ -453,7 +483,7 @@ const float CORNER_EXIT_DEG = 4.0f;
 const uint16_t CORNER_EXIT_MS = 350;
 const uint16_t HOLD_AFTER_CORNER_MS = 4000;
 
-const float CENTER_PEAK_THRESHOLD = 15.0f;   // above this: show peak
+const float CENTER_PEAK_THRESHOLD = 30.0f;   // above this: show peak
 const float CENTER_OPPOSITE_CANCEL = 5.0f;   // opposite-side degrees to cancel hold
 
 // ---------------- G-Force ----------------
@@ -466,6 +496,8 @@ float G_DEADZONE            = 0.04f;   // Motorvibrationen < 0.04g werden ignori
 float pitchOffsetDeg        = 0.0f;    // sensor pitch correction in degrees (saved in EEPROM)
 
 float maxGSaved = 0.0f;
+float maxGBrake = 0.0f;   // session peak braking G (positive value)
+float maxGAccel = 0.0f;   // session peak acceleration G (positive value)
 
 // 4 Quadranten × 2 stärkste Peaks (RAM-only, weg beim Neustart)
 // Quadrant: 0=rechts/vorne (+x/+y), 1=links/vorne (-x/+y),
@@ -589,24 +621,26 @@ static void pollBno085()
 	sh2_SensorValue_t ev;
 	while (bno.getSensorEvent(&ev))
 	{
-		if (ev.sensorId == SH2_GAME_ROTATION_VECTOR)
+		if (ev.sensorId == SH2_ARVR_STABILIZED_GRV)
 		{
-			bno085Roll = bno085QuatToRoll(
-				ev.un.gameRotationVector.i,
-				ev.un.gameRotationVector.j,
-				ev.un.gameRotationVector.k,
-				ev.un.gameRotationVector.real);
-			bno085Pitch = bno085QuatToPitch(
-				ev.un.gameRotationVector.i,
-				ev.un.gameRotationVector.j,
-				ev.un.gameRotationVector.k,
-				ev.un.gameRotationVector.real);
+			bno085Qi = ev.un.arvrStabilizedGRV.i;
+			bno085Qj = ev.un.arvrStabilizedGRV.j;
+			bno085Qk = ev.un.arvrStabilizedGRV.k;
+			bno085Qr = ev.un.arvrStabilizedGRV.real;
+			bno085Roll  = bno085QuatToRoll (bno085Qi, bno085Qj, bno085Qk, bno085Qr);
+			bno085Pitch = bno085QuatToPitch(bno085Qi, bno085Qj, bno085Qk, bno085Qr);
 		}
 		else if (ev.sensorId == SH2_LINEAR_ACCELERATION)
 		{
 			bno085LinX = ev.un.linearAcceleration.x;
 			bno085LinY = ev.un.linearAcceleration.y;
 			bno085LinZ = ev.un.linearAcceleration.z;
+		}
+		else if (ev.sensorId == SH2_GYROSCOPE_CALIBRATED)
+		{
+			bno085GyroX = ev.un.gyroscope.x;
+			bno085GyroY = ev.un.gyroscope.y;
+			bno085GyroZ = ev.un.gyroscope.z;
 		}
 	}
 }
@@ -649,7 +683,7 @@ static int mapf_to_i(float v, float inMin, float inMax, int outMin, int outMax)
 }
 static void oledSetContrast(uint8_t c)
 {
-	display.ssd1306_command(SSD1306_SETCONTRAST);
+	display.ssd1306_command(0x81); // SSD1306_SETCONTRAST
 	display.ssd1306_command(c);
 }
 
@@ -693,6 +727,15 @@ bool loadMaxValues()
 			leanFlip       = (eeFlip == 1);
 			pitchOffsetDeg = clampf((float)eePitch, -20.0f, 20.0f);
 			rollOffsetDeg  = clampf((float)eeRoll,  -20.0f, 20.0f);
+			// DS18B20 offset: stored as int8 tenths of °C
+			int8_t eeDs18  = (int8_t)EEPROM.read(EE_SET_DS18_OFF);
+			DS18B20_OFFSET = clampf((float)eeDs18 * 0.1f, -3.0f, 3.0f);
+			// Battery low: stored as uint8 tenths of V
+			uint8_t eeBatt = EEPROM.read(EE_SET_BATT_LOW);
+			BATT_LOW_V     = clampf((float)eeBatt * 0.1f, 8.0f, 14.0f);
+			// G deadzone: stored as uint8 hundredths of g
+			uint8_t eeGD   = EEPROM.read(EE_SET_G_DEAD);
+			G_DEADZONE     = clampf((float)eeGD   * 0.01f, 0.0f, 0.20f);
 		}
 		// else: keep compile-time defaults (DS18B20_OFFSET=-1.2, BATT_LOW_V=10.5, G_DEADZONE=0.04)
 	}
@@ -700,6 +743,8 @@ bool loadMaxValues()
 	{
 		maxLeanSaved = 0.0f;
 		maxGSaved = 0.0f;
+		maxGBrake = 0.0f;
+		maxGAccel = 0.0f;
 	}
 
 	// clamp to sane ranges (guard against uninitialized / corrupt EEPROM)
@@ -751,6 +796,9 @@ void saveMaxValuesNow()
 	EEPROM.write(EE_SET_LEAN_FLIP, leanFlip ? 1 : 0);
 	EEPROM.write(EE_SET_PITCH_OFF, (uint8_t)(int8_t)lroundf(pitchOffsetDeg));
 	EEPROM.write(EE_SET_ROLL_OFF,  (uint8_t)(int8_t)lroundf(rollOffsetDeg));
+	EEPROM.write(EE_SET_DS18_OFF,  (uint8_t)(int8_t)lroundf(DS18B20_OFFSET * 10.0f));
+	EEPROM.write(EE_SET_BATT_LOW,  (uint8_t)lroundf(clampf(BATT_LOW_V, 8.0f, 14.0f) * 10.0f));
+	EEPROM.write(EE_SET_G_DEAD,    (uint8_t)lroundf(clampf(G_DEADZONE, 0.0f, 0.20f) * 100.0f));
 
 	EEPROM.commit();
 }
@@ -790,7 +838,7 @@ void buttonUpdate()
 			// Wake display if sleeping – consume this press
 			if (displaySleeping)
 			{
-				display.ssd1306_command(SSD1306_DISPLAYON);
+				display.ssd1306_command(0xAF); // SSD1306_DISPLAYON
 				displaySleeping = false;
 				sleepCountdownActive = false;
 				btn.longFired = true; // suppress any page change on release
@@ -800,6 +848,7 @@ void buttonUpdate()
 			btn.pressStartMs = now;
 			btn.longFired = false;
 			settingsLongFired = false;
+			leanResetFired = false;
 			settingsPressStartMs = now;
 		}
 		else
@@ -823,7 +872,17 @@ void buttonUpdate()
 			{
 				if (btn.pressed && !btn.longFired)
 				{
-					page = (Page)((page + 1) % (PAGE_RACEBOX + 1));
+					// Cycle within current navigation group
+					if (primaryGroup)
+					{
+						page = (page == PAGE_OIL) ? PAGE_LEAN : PAGE_OIL;
+					}
+					else
+					{
+						if (page == PAGE_G)            page = PAGE_ENGINE;
+						else if (page == PAGE_ENGINE)  page = PAGE_RACEBOX;
+						else                           page = PAGE_G;
+					}
 					resetAnimUntilMs = 0;
 				}
 				raceboxBtnArmed = true; // re-arm after button fully released
@@ -854,10 +913,12 @@ void buttonUpdate()
 				switch (settingsIdx)
 				{
 					case SET_BRIGHTNESS:
-						brightMode = (brightMode + 1) % 3;
+						brightMode = (brightMode + 1) % 4;
 						// apply immediately
-						if (brightMode == 1) oledSetContrast(CONTRAST_DAY);
-						else if (brightMode == 2) oledSetContrast(CONTRAST_NIGHT);
+						if (brightMode == 1) { oledSetContrast(CONTRAST_DAY);   display.invertDisplay(false); sunInverted = false; }
+						else if (brightMode == 2) { oledSetContrast(CONTRAST_NIGHT); display.invertDisplay(false); sunInverted = false; }
+						else if (brightMode == 3) { oledSetContrast(CONTRAST_DAY);   display.invertDisplay(true);  sunInverted = true;  }
+						else                      { display.invertDisplay(false); sunInverted = false; } // Auto
 						break;
 					case SET_PITCH_OFFSET:
 						// capture current sensor pitch as offset
@@ -878,6 +939,28 @@ void buttonUpdate()
 						rollOffsetDeg = clampf(bno085Roll - ROLL_MOUNT_OFFSET_DEG, -20.0f, 20.0f);
 						maxDirty = true;
 						break;
+					case SET_RESET_LEAN:
+						maxLeanSaved = 0.0f;
+						maxLeanLeft  = 0.0f;
+						maxLeanRight = 0.0f;
+						maxDirty = true;
+						resetAnimUntilMs = now + 350;
+						break;
+					case SET_DS18_OFFSET:
+						// step +0.5°C, wrap -3.0 → +3.0
+						DS18B20_OFFSET += 0.5f;
+						if (DS18B20_OFFSET > 3.0f + 0.01f) DS18B20_OFFSET = -3.0f;
+						break;
+					case SET_BATT_LOW:
+						// step +0.5V, wrap 8.0 → 14.0
+						BATT_LOW_V += 0.5f;
+						if (BATT_LOW_V > 14.0f + 0.01f) BATT_LOW_V = 8.0f;
+						break;
+					case SET_G_DEADZONE:
+						// step +0.01g, wrap 0.00 → 0.20
+						G_DEADZONE += 0.01f;
+						if (G_DEADZONE > 0.20f + 0.001f) G_DEADZONE = 0.0f;
+						break;
 					default: break;
 				}
 			}
@@ -885,7 +968,7 @@ void buttonUpdate()
 		else
 		{
 			// ---- normal long press ----
-			// 5s on the oil page → open settings
+			// OIL: 5s → settings (unchanged, no other action on this page)
 			if (page == PAGE_OIL)
 			{
 				if (!btn.longFired && (now - btn.pressStartMs) >= SETTINGS_OPEN_MS)
@@ -895,45 +978,41 @@ void buttonUpdate()
 					settingsIdx   = 0;
 					settingsLastActMs = now;
 					settingsLongFired = false;
-					settingsEnterReleasePending = true; // suppress next release
+					settingsEnterReleasePending = true;
 				}
-				return; // on oil page, no other long-press action exists
+				return;
 			}
 
-			const unsigned long threshold = (page == PAGE_RACEBOX || page == PAGE_ENGINE) ? RACEBOX_LONGPRESS_MS : LONGPRESS_MS;
-			if ((now - btn.pressStartMs) >= threshold)
+			// 2.5 s hold on LEAN page → reset L/R max lean (fires even after longFired)
+			if (page == PAGE_LEAN && !leanResetFired && (now - btn.pressStartMs) >= 2500)
+			{
+				leanResetFired   = true;
+				maxLeanSaved     = 0.0f;
+				maxLeanLeft      = 0.0f;
+				maxLeanRight     = 0.0f;
+				maxDirty         = true;
+				resetAnimUntilMs = now + 350;
+			}
+
+			if ((now - btn.pressStartMs) >= LONGPRESS_MS)
 			{
 				btn.longFired = true;
 
 				if (page == PAGE_LEAN)
 				{
-					maxLeanSaved = 0.0f;
-					maxLeanLeft  = 0.0f;
-					maxLeanRight = 0.0f;
-					maxDirty = true;
-					resetAnimUntilMs = now + 350;
+					// LEAN long press → enter secondary group
+					lastPrimaryPage   = PAGE_LEAN;
+					primaryGroup      = false;
+					page              = lastSecondaryPage;
+					resetAnimUntilMs  = 0;
 				}
-				else if (page == PAGE_G)
+				else
 				{
-					maxGSaved = 0.0f;
-					memset(gQuadPeaks,   0, sizeof(gQuadPeaks));
-					memset(gQuadHasSlot, 0, sizeof(gQuadHasSlot));
-					maxDirty = true;
-					resetAnimUntilMs = now + 350;
-				}
-				else if (page == PAGE_ENGINE)
-				{
-					// arm / reset 0-100 timer
-					if (sprint100State == S100_IDLE || sprint100State == S100_DONE)
-						sprint100State = S100_ARMED;
-					else
-						sprint100State = S100_IDLE;
-				}
-				else if (page == PAGE_RACEBOX && raceboxBtnArmed)
-				{
-					digitalWrite(RACEBOX_BTN_PIN, HIGH);
-					raceboxBtnUntilMs = now + 1000;
-					raceboxBtnArmed = false;
+					// Any secondary page long press → back to primary group
+					lastSecondaryPage = page;
+					primaryGroup      = true;
+					page              = lastPrimaryPage;
+					resetAnimUntilMs  = 0;
 				}
 			}
 		}
@@ -990,13 +1069,64 @@ float readOilTempOnce()
 // =========================================================
 void updateCan()
 {
-	// Round-robin 5 PIDs at 200ms interval → each PID updated every ~1s
-	static const uint8_t pidList[] = { 0x05, 0x0C, 0x04, 0x11, 0x0D };
+	// Poll rates:
+	//   RPM   (0x0C): 100ms / 10Hz – redline detection needs fast updates
+	//   Speed (0x0D): 200ms /  5Hz – lean physics model atan(v·ψ̇/g) needs fresh speed
+	//   Rest  (0x05 coolant, 0x04 load, 0x11 throttle): 333ms round-robin → ~1s each
+	static const uint8_t pidList[] = { 0x05, 0x04, 0x11 };
 	static uint8_t pidIdx = 0;
-	static unsigned long lastCanRequestMs = 0;
+	static unsigned long lastCanRequestMs  = 0;
+	static unsigned long lastRpmRequestMs  = 0;
+	static unsigned long lastSpeedRequestMs = 0;
+	static unsigned long lastCanRxMs = 0; // timestamp of last valid OBD2 frame
 	unsigned long now = millis();
 
-	if (now - lastCanRequestMs >= 200)
+	// Staleness timeout: if no valid frame received for 3 s, reset all cached values
+	// to NAN so the lean drift-cancel physics model doesn't use stale speed data.
+	if (lastCanRxMs != 0 && (now - lastCanRxMs) > 3000)
+	{
+		coolantTempCached  = NAN;
+		engineRpmCached    = NAN;
+		engineLoadCached   = NAN;
+		throttlePosCached  = NAN;
+		vehicleSpeedCached = NAN;
+		lastCanRxMs = 0; // prevent repeated clears
+	}
+
+	// Fast RPM poll: 100ms = 10Hz so brief redline spikes are reliably caught
+	if (now - lastRpmRequestMs >= 100)
+	{
+		lastRpmRequestMs = now;
+		twai_message_t req;
+		req.identifier        = 0x18DB33F1;
+		req.extd              = 1;
+		req.rtr               = 0;
+		req.data_length_code  = 8;
+		req.data[0] = 0x02;
+		req.data[1] = 0x01;
+		req.data[2] = 0x0C; // RPM
+		req.data[3] = req.data[4] = req.data[5] = req.data[6] = req.data[7] = 0x00;
+		twai_transmit(&req, pdMS_TO_TICKS(10));
+	}
+
+	// Medium speed poll: 200ms = 5Hz for lean drift-correction physics model
+	if (now - lastSpeedRequestMs >= 200)
+	{
+		lastSpeedRequestMs = now;
+		twai_message_t req;
+		req.identifier        = 0x18DB33F1;
+		req.extd              = 1;
+		req.rtr               = 0;
+		req.data_length_code  = 8;
+		req.data[0] = 0x02;
+		req.data[1] = 0x01;
+		req.data[2] = 0x0D; // Speed
+		req.data[3] = req.data[4] = req.data[5] = req.data[6] = req.data[7] = 0x00;
+		twai_transmit(&req, pdMS_TO_TICKS(10));
+	}
+
+	// Slow round-robin for coolant / load / throttle at 333ms each (~1s cycle)
+	if (now - lastCanRequestMs >= 333)
 	{
 		lastCanRequestMs = now;
 		twai_message_t req;
@@ -1009,7 +1139,7 @@ void updateCan()
 		req.data[2] = pidList[pidIdx];
 		req.data[3] = req.data[4] = req.data[5] = req.data[6] = req.data[7] = 0x00;
 		twai_transmit(&req, pdMS_TO_TICKS(10));
-		pidIdx = (pidIdx + 1) % 5;
+		pidIdx = (pidIdx + 1) % 3;
 	}
 
 	// non-blocking receive – drain all queued frames each call
@@ -1017,6 +1147,7 @@ void updateCan()
 	while (twai_receive(&resp, 0) == ESP_OK)
 	{
 		if (!resp.extd || resp.data_length_code < 4 || resp.data[1] != 0x41) continue;
+		lastCanRxMs = now; // refresh staleness timer on any valid frame
 		switch (resp.data[2])
 		{
 			case 0x05: coolantTempCached  = (float)(resp.data[3]) - 40.0f; break;
@@ -1307,7 +1438,16 @@ void updateCurvePeakHold(float leanAbs)
 		cornerPeak = leanAbs;
 
 	if (cornerPeak >= CENTER_PEAK_THRESHOLD)
-		cornerAboveThreshold = true;
+	{
+		// Only re-enable peak display if the decline timer hasn't already expired.
+		// Without this guard, returning above 15° after 4+ seconds at lower angle
+		// would re-activate cornerAboveThreshold and show the old peak (e.g. 26°)
+		// instead of the current live lean angle.
+		bool alreadyExpired = cornerDeclineStartMs != 0 &&
+		                      (now - cornerDeclineStartMs >= HOLD_AFTER_CORNER_MS);
+		if (!alreadyExpired)
+			cornerAboveThreshold = true;
+	}
 
 	// Track when lean drops back below threshold after peak was reached
 	if (cornerAboveThreshold)
@@ -1363,23 +1503,125 @@ void updateLean()
 		return;
 
 	pollBno085();
-	float roll = normalizeAngleDeg(bno085Roll - ROLL_MOUNT_OFFSET_DEG - rollOffsetDeg) * (leanFlip ? -1.0f : 1.0f);
 
-	static bool initDone = false;
+	// ── OEM-style drift correction ────────────────────────────────────────────────
+	// Bosch/Continental moto-IMUs solve the centripetal-drift problem with a
+	// three-mode gravity-reference correction:
+	//
+	//  MODE 1 – SPEED < 10 km/h (stopped / traffic light)
+	//    Bike must be upright. Correct aggressively (τ = 1 s).
+	//
+	//  MODE 2 – GOING STRAIGHT (|ωbody| < 0.08 rad/s)
+	//    Centripetal force ≈ 0, gravity reference is reliable. Correct τ = 4 s.
+	//
+	//  MODE 3 – CORNERING + OBD2 SPEED AVAILABLE  ← the OEM trick
+	//    Steady-state lean satisfies:  θ_expected = atan(v · ψ̇_earth / g)
+	//    where ψ̇_earth = earth-frame yaw rate (from quaternion × body-gyro).
+	//    We know the true lean from physics → update driftCancel continuously (τ = 3 s)
+	//    so drift never has a chance to accumulate, even through repeated S-bends.
+	//
+	//  MODE 4 – CORNERING, NO SPEED (OBD2 not available)
+	//    No physics reference → freeze driftCancel (same as before).
+	//
+	// Earth-frame yaw rate: project body angular velocity onto world Z-axis.
+	//   ω_z_earth = R[2][0]*ωx + R[2][1]*ωy + R[2][2]*ωz
+	//   R from Hamilton quaternion q=(Qr,Qi,Qj,Qk):
+	//     R[2][0] = 2(Qi·Qk - Qr·Qj)
+	//     R[2][1] = 2(Qj·Qk + Qr·Qi)
+	//     R[2][2] = 1 - 2(Qi² + Qj²)
+	static float driftCancel = 0.0f;
+	static bool  initDone    = false;
+	static unsigned long lastLeanMs = 0;
+
+	unsigned long leanNowMs = millis();
+	float leanDt = (lastLeanMs == 0) ? 0.0f : (float)(leanNowMs - lastLeanMs) * 0.001f;
+	if (leanDt > 0.5f) leanDt = 0.0f;
+	lastLeanMs = leanNowMs;
+
+	// Subtract zero-offsets, then correct for sensor pitch mount offset.
+	// A pitch-mounted sensor reports atan(sin(φ)/(cos(φ)·cos(p))) instead of φ.
+	// Inverse: φ = atan(tan(measured) · cos(p))  — error is ~1.5° at 30°, ~1.8° at 45°.
+	float rawRollDeg  = bno085Roll - ROLL_MOUNT_OFFSET_DEG - rollOffsetDeg;
+	float rawRoll;
+	if (pitchOffsetDeg != 0.0f)
+	{
+		float rrRad = rawRollDeg * (float)(M_PI / 180.0);
+		float pRad  = pitchOffsetDeg * (float)(M_PI / 180.0);
+		rawRoll = normalizeAngleDeg(atanf(tanf(rrRad) * cosf(pRad)) * (float)(180.0 / M_PI));
+	}
+	else
+	{
+		rawRoll = normalizeAngleDeg(rawRollDeg);
+	}
 	if (!initDone)
 	{
-		rollFiltered = roll;
-		rollUi = roll;
+		driftCancel  = rawRoll;
+		rollFiltered = 0.0f;
+		rollUi       = 0.0f;
 		initDone = true;
 	}
 
-	rollFiltered += LEAN_ALPHA * (roll - rollFiltered);
+	if (leanDt > 0.0f)
+	{
+		// Earth-frame yaw rate (valid at any lean angle, no mounting-orientation assumption)
+		float yawRateEarth =
+			 2.0f*(bno085Qi*bno085Qk - bno085Qr*bno085Qj)*bno085GyroX
+			+2.0f*(bno085Qj*bno085Qk + bno085Qr*bno085Qi)*bno085GyroY
+			+(1.0f - 2.0f*(bno085Qi*bno085Qi + bno085Qj*bno085Qj))*bno085GyroZ;
 
-	float target = rollFiltered;
-	if (fabs(target) < LEAN_DEADZONE_DEG)
-		target = 0.0f;
+		float omegaSq = bno085GyroX*bno085GyroX
+		              + bno085GyroY*bno085GyroY
+		              + bno085GyroZ*bno085GyroZ;
+		const float OMEGA_CORNER  = 0.08f; // rad/s threshold: below = going straight
+		bool isCornering   = (omegaSq > OMEGA_CORNER * OMEGA_CORNER);
+		bool slowOrStopped = (!isnan(vehicleSpeedCached) && vehicleSpeedCached < 10.0f);
+		bool hasSpeed      = (!isnan(vehicleSpeedCached) && vehicleSpeedCached >= 10.0f);
 
-	rollUi += LEAN_UI_ALPHA * (target - rollUi);
+		if (slowOrStopped)
+		{
+			// MODE 1: stopped – fast full correction
+			driftCancel += (leanDt / 1.0f) * (rawRoll - driftCancel);
+		}
+		else if (!isCornering)
+		{
+			// MODE 2: straight line – gravity reference reliable, correct τ = 4 s
+			driftCancel += (leanDt / 4.0f) * (rawRoll - driftCancel);
+		}
+		else if (hasSpeed)
+		{
+			// MODE 3: OEM physics model
+			// Expected lean from vehicle dynamics: θ = atan(v · ψ̇_earth / g)
+			float v_m_s = vehicleSpeedCached / 3.6f;
+			float leanExpected_deg = atan2f(v_m_s * yawRateEarth, G0) * (180.0f / M_PI);
+			// Solve for what driftCancel must be so that (rawRoll - driftCancel) = leanExpected
+			float target = rawRoll - leanExpected_deg;
+			driftCancel += (leanDt / 3.0f) * (target - driftCancel);
+		}
+		// MODE 4: cornering + no speed → freeze (safe fallback)
+	}
+
+	float roll = (rawRoll - driftCancel) * (leanFlip ? -1.0f : 1.0f);
+
+	// Time-based EMA: α = dt/τ so filter speed is independent of loop/event rate
+	float leanAlpha   = clampf(leanDt / LEAN_TAU_S,    0.0f, 1.0f);
+	float leanUiAlpha = clampf(leanDt / LEAN_UI_TAU_S, 0.0f, 1.0f);
+	rollFiltered += leanAlpha * (roll - rollFiltered);
+
+	// Soft deadzone: instead of a hard snap to 0, smoothly suppress small angles
+	// using a cubic curve:  output = input * (|input|/deadzone)^2  inside the zone.
+	// Outside the zone the value passes through unchanged.
+	float target;
+	if (fabsf(rollFiltered) < LEAN_DEADZONE_DEG)
+	{
+		float t = rollFiltered / LEAN_DEADZONE_DEG;  // -1..+1
+		target = rollFiltered * (t * t);             // cubic → smooth 0 near centre
+	}
+	else
+	{
+		target = rollFiltered;
+	}
+
+	rollUi += leanUiAlpha * (target - rollUi);
 
 	float leanAbs = fabs(rollFiltered);
 	if (leanAbs < 0.5f)
@@ -1436,6 +1678,9 @@ void updateGForce()
 		maxGSaved = mag;
 		maxDirty = true;
 	}
+	// Brake / accel peak (longitudinal axis only)
+	if (gXFast < 0.0f && -gXFast > maxGBrake) maxGBrake = -gXFast;
+	if (gXFast > 0.0f &&  gXFast > maxGAccel) maxGAccel =  gXFast;
 	// Quadranten-Peak-Puffer aktualisieren
 	{
 		uint8_t q = gQuadrant(gXFast, gYFast);
@@ -1491,6 +1736,11 @@ void updateNightMode()
 		oledSetContrast(CONTRAST_NIGHT);
 		return;
 	}
+	if (brightMode == 3)
+	{
+		// Sonne: forced invert, max contrast – nothing to auto-adjust
+		return;
+	}
 
 	// Auto mode: use BH1750
 	if (!bhOk)
@@ -1530,6 +1780,9 @@ void updateNightMode()
 			displayInverted = false;
 		}
 	}
+
+	// Sun-invert: only in Auto mode if explicitly enabled via brightMode==3 (Sonne)
+	// In Auto mode we only adjust contrast, never invert.
 }
 
 // =========================================================
@@ -2017,6 +2270,20 @@ void drawLeanPage()
 
 	drawBlitzerWarnerAliveIndicator();
 	drawRpmRedlineBorder();
+
+	// CAN offline indicator: small "CAN" badge top-right when OBD2 speed is unavailable.
+	// Physics drift-correction (Mode 3) relies on speed → warns rider it's inactive.
+	if (isnan(vehicleSpeedCached))
+	{
+		display.setFont();
+		display.setTextSize(1);
+		const int16_t bx = SCREEN_WIDTH - 22;
+		const int16_t by = 1;
+		display.drawRect(bx, by, 21, 10, SSD1306_WHITE);
+		display.setCursor(bx + 2, by + 1);
+		display.print("CAN");
+	}
+
 	display.display();
 }
 
@@ -2112,10 +2379,59 @@ void drawGPage()
 {
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
+	display.setFont();
+	display.setTextSize(1);
 
-	drawGCircle(gX, gY, maxGSaved);
+	// ---- Header labels ----
+	display.setCursor(2, 1);
+	display.print("< BREMSEN");
+	display.setCursor(84, 1);
+	display.print("GAS >");
 
-	// reset flash
+	// ---- Large current G value ----
+	char gBuf[8];
+	snprintf(gBuf, sizeof(gBuf), "%.2fg", fabsf(gX));
+	display.setFont(&FreeSansBold18pt7b);
+	int16_t bx, by; uint16_t bw, bh;
+	display.getTextBounds(gBuf, 0, 0, &bx, &by, &bw, &bh);
+	display.setCursor((SCREEN_WIDTH - (int16_t)bw) / 2 - bx, 36);
+	display.print(gBuf);
+	display.setFont();
+	display.setTextSize(1);
+
+	// ---- Horizontal bar (y=42, h=8) ----
+	// range ±1.5g, centre at x=64, usable half-width = 58px
+	const int16_t BAR_Y  = 42;
+	const int16_t BAR_H  = 8;
+	const int16_t BAR_CX = 64;
+	const float   BAR_G  = 1.5f;
+	const int16_t BAR_HW = 58; // half-width in pixels
+	display.drawRect(BAR_CX - BAR_HW, BAR_Y, BAR_HW * 2, BAR_H, SSD1306_WHITE);
+	display.drawFastVLine(BAR_CX, BAR_Y, BAR_H, SSD1306_WHITE); // centre tick
+	// fill
+	if (fabsf(gX) > 0.01f)
+	{
+		int16_t fillW = (int16_t)((fabsf(gX) / BAR_G) * (float)BAR_HW);
+		if (fillW > BAR_HW) fillW = BAR_HW;
+		if (fillW > 0)
+		{
+			if (gX < 0.0f) // braking: fill left from centre
+				display.fillRect(BAR_CX - fillW, BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
+			else            // accel: fill right from centre
+				display.fillRect(BAR_CX + 1,     BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
+		}
+	}
+
+	// ---- Peak values ----
+	char pbuf[10];
+	snprintf(pbuf, sizeof(pbuf), "M:%.2fg", maxGBrake);
+	display.setCursor(2, 54);
+	display.print(pbuf);
+	snprintf(pbuf, sizeof(pbuf), "M:%.2fg", maxGAccel);
+	display.setCursor(128 - (int16_t)(strlen(pbuf) * 6) - 2, 54);
+	display.print(pbuf);
+
+	// ---- reset flash ----
 	unsigned long now = millis();
 	if (now < resetAnimUntilMs)
 	{
@@ -2413,36 +2729,62 @@ void drawSettingsPage()
 	// Title bar
 	display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
 	display.setTextColor(SSD1306_BLACK);
-	display.setCursor(3, 2);
-	display.print("EINSTELLUNGEN");
+	// Left: ESP temperature
+	char hdrBuf[8];
+	snprintf(hdrBuf, sizeof(hdrBuf), "%.0fC", (double)temperatureRead());
+	display.setCursor(2, 2);
+	display.print(hdrBuf);
+	// Centre: title
+	display.setCursor(38, 2);
+	display.print("SETTINGS");
+	// Right: free heap as percentage
+	uint8_t heapPct = (uint8_t)(ESP.getFreeHeap() * 100 / ESP.getHeapSize());
+	snprintf(hdrBuf, sizeof(hdrBuf), "%u%%", heapPct);
+	int16_t rx = 128 - (int16_t)(strlen(hdrBuf) * 6) - 2;
+	display.setCursor(rx, 2);
+	display.print(hdrBuf);
 	display.setTextColor(SSD1306_WHITE);
 
-	// Items – 5 rows of 10px each starting at y=13
+	// Items – 10px per row, 5 visible at a time (title=10px, bottom bar=1px → 53px usable)
+	// Scroll window follows selected item.
+	const int16_t ITEM_H      = 10;
+	const int16_t VISIBLE     = 5;
+	const int16_t LIST_TOP    = 11; // first item y
+
 	const char* labels[SET_COUNT] = {
 		"Brightness",
 		"Sleep Mode",
 		"Lean Flip",
 		"Lean Offset",
-		"Pitch Offset"
+		"Pitch Offset",
+		"Reset Lean",
+		"Temp Offset",
+		"Batt Warnung",
+		"G Deadzone"
 	};
 
+	// Scroll offset: keep selected item in view
+	int8_t scrollTop = (int8_t)settingsIdx - (VISIBLE - 1);
+	if (scrollTop < 0) scrollTop = 0;
+	if (scrollTop > (int8_t)(SET_COUNT - VISIBLE)) scrollTop = (int8_t)(SET_COUNT - VISIBLE);
+
 	char valBuf[14];
-	for (uint8_t i = 0; i < SET_COUNT; i++)
+	for (int8_t i = scrollTop; i < scrollTop + VISIBLE && i < (int8_t)SET_COUNT; i++)
 	{
-		int16_t y = 13 + i * 10;
+		int16_t y = LIST_TOP + (i - scrollTop) * ITEM_H;
 
-		if (i == settingsIdx)
-			display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE);
+		if (i == (int8_t)settingsIdx)
+			display.fillRect(0, y, 128, ITEM_H - 1, SSD1306_WHITE);
 
-		display.setTextColor(i == settingsIdx ? SSD1306_BLACK : SSD1306_WHITE);
-		display.setCursor(2, y);
+		display.setTextColor(i == (int8_t)settingsIdx ? SSD1306_BLACK : SSD1306_WHITE);
+		display.setCursor(2, y + 1);
 		display.print(labels[i]);
 
 		switch (i)
 		{
 			case SET_BRIGHTNESS:
 			{
-				const char* bNames[] = { "Auto", "Tag", "Nacht" };
+				const char* bNames[] = { "Auto", "Tag", "Nacht", "Sonne" };
 				snprintf(valBuf, sizeof(valBuf), "%s", bNames[brightMode]);
 				break;
 			}
@@ -2458,13 +2800,25 @@ void drawSettingsPage()
 			case SET_LEAN_OFFSET:
 				snprintf(valBuf, sizeof(valBuf), "%+.0f Grad", rollOffsetDeg);
 				break;
+			case SET_RESET_LEAN:
+				snprintf(valBuf, sizeof(valBuf), "HOLD");
+				break;
+			case SET_DS18_OFFSET:
+				snprintf(valBuf, sizeof(valBuf), "%+.1f C", DS18B20_OFFSET);
+				break;
+			case SET_BATT_LOW:
+				snprintf(valBuf, sizeof(valBuf), "%.1f V", BATT_LOW_V);
+				break;
+			case SET_G_DEADZONE:
+				snprintf(valBuf, sizeof(valBuf), "%.2f g", G_DEADZONE);
+				break;
 			default:
 				valBuf[0] = 0;
 				break;
 		}
 
 		int16_t vx = 128 - (int16_t)(strlen(valBuf) * 6) - 2;
-		display.setCursor(vx, y);
+		display.setCursor(vx, y + 1);
 		display.print(valBuf);
 	}
 	display.setTextColor(SSD1306_WHITE);
@@ -2621,9 +2975,13 @@ void bootProgressInitAndMaybeCalibrate()
 	bnoOk = bno.begin_I2C();
 	if (bnoOk)
 	{
-		// GAME_ROTATION_VECTOR: fused gyro+accel, NO magnetometer → no drift from vibration
-		bno.enableReport(SH2_GAME_ROTATION_VECTOR, 10000);  // 10ms = 100Hz
-		bno.enableReport(SH2_LINEAR_ACCELERATION,  10000);  // 10ms = 100Hz
+		// ARVR_STABILIZED_GRV: gyro+accel fusion, NO magnetometer, stabilized for sustained tilt
+		// → reduces (but doesn't fully eliminate) centripetal-acceleration drift during cornering
+		bno.enableReport(SH2_ARVR_STABILIZED_GRV,      10000);  // 10ms = 100Hz
+		bno.enableReport(SH2_LINEAR_ACCELERATION,       10000);  // 10ms = 100Hz
+		// Calibrated gyro: used in software to detect active cornering (non-zero angular rate)
+		// so we only apply drift correction when the bike is actually going straight.
+		bno.enableReport(SH2_GYROSCOPE_CALIBRATED,     10000);  // 10ms = 100Hz
 		delay(100);
 	}
 	stBno = bnoOk ? 1 : 0;
@@ -2956,7 +3314,7 @@ void loop()
 		{
 			sleepCountdownActive = false;
 			displaySleeping = true;
-			display.ssd1306_command(SSD1306_DISPLAYOFF);
+			display.ssd1306_command(0xAE); // SSD1306_DISPLAYOFF
 		}
 
 		// settings overlay takes priority over everything except blitzer
