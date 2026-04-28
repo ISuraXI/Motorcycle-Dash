@@ -1675,8 +1675,8 @@ void updateGForce()
 		maxDirty = true;
 	}
 	// Brake / accel peak (longitudinal axis only)
-	if (gXFast < 0.0f && -gXFast > maxGBrake) maxGBrake = -gXFast;
-	if (gXFast > 0.0f &&  gXFast > maxGAccel) maxGAccel =  gXFast;
+	if (gYFast < 0.0f && -gYFast > maxGBrake) maxGBrake = -gYFast;
+	if (gYFast > 0.0f &&  gYFast > maxGAccel) maxGAccel =  gYFast;
 	// Quadranten-Peak-Puffer aktualisieren
 	{
 		uint8_t q = gQuadrant(gXFast, gYFast);
@@ -2384,9 +2384,9 @@ void drawGPage()
 	display.setCursor(84, 1);
 	display.print("GAS >");
 
-	// ---- Large current G value ----
+	// ---- Large current G value (kein "g") ----
 	char gBuf[8];
-	snprintf(gBuf, sizeof(gBuf), "%.2fg", fabsf(gX));
+	snprintf(gBuf, sizeof(gBuf), "%.2f", fabsf(gY));
 	display.setFont(&FreeSansBold18pt7b);
 	int16_t bx, by; uint16_t bw, bh;
 	display.getTextBounds(gBuf, 0, 0, &bx, &by, &bw, &bh);
@@ -2404,17 +2404,17 @@ void drawGPage()
 	const int16_t BAR_HW = 58; // half-width in pixels
 	display.drawRect(BAR_CX - BAR_HW, BAR_Y, BAR_HW * 2, BAR_H, SSD1306_WHITE);
 	display.drawFastVLine(BAR_CX, BAR_Y, BAR_H, SSD1306_WHITE); // centre tick
-	// fill
-	if (fabsf(gX) > 0.01f)
+	// fill (gY positiv = Gas, gY negativ = Bremsen)
+	if (fabsf(gY) > 0.01f)
 	{
-		int16_t fillW = (int16_t)((fabsf(gX) / BAR_G) * (float)BAR_HW);
+		int16_t fillW = (int16_t)((fabsf(gY) / BAR_G) * (float)BAR_HW);
 		if (fillW > BAR_HW) fillW = BAR_HW;
 		if (fillW > 0)
 		{
-			if (gX < 0.0f) // braking: fill left from centre
-				display.fillRect(BAR_CX - fillW, BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
-			else            // accel: fill right from centre
+			if (gY < 0.0f) // Bremsen: rechts
 				display.fillRect(BAR_CX + 1,     BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
+			else            // Gas: links
+				display.fillRect(BAR_CX - fillW, BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
 		}
 	}
 
