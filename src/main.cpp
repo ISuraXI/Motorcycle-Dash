@@ -1071,7 +1071,7 @@ void updateCan()
 {
 	// Poll rates:
 	//   RPM   (0x0C): 100ms / 10Hz – redline detection needs fast updates
-	//   Speed (0x0D): 200ms /  5Hz – lean physics model atan(v·ψ̇/g) needs fresh speed
+	//   Speed (0x0D): 100ms / 10Hz – lean physics model braucht frische Geschwindigkeit
 	//   Rest  (0x05 coolant, 0x04 load, 0x11 throttle): 333ms round-robin → ~1s each
 	static const uint8_t pidList[] = { 0x05, 0x04, 0x11 };
 	static uint8_t pidIdx = 0;
@@ -1109,8 +1109,8 @@ void updateCan()
 		twai_transmit(&req, pdMS_TO_TICKS(10));
 	}
 
-	// Medium speed poll: 200ms = 5Hz for lean drift-correction physics model
-	if (now - lastSpeedRequestMs >= 200)
+	// Speed poll: 100ms = 10Hz, gleich schnell wie RPM
+	if (now - lastSpeedRequestMs >= 100)
 	{
 		lastSpeedRequestMs = now;
 		twai_message_t req;
@@ -1574,17 +1574,13 @@ void updateLean()
 		              + bno085GyroZ*bno085GyroZ;
 		const float OMEGA_CORNER  = 0.08f; // rad/s threshold: below = going straight
 		bool isCornering   = (omegaSq > OMEGA_CORNER * OMEGA_CORNER);
-		bool slowOrStopped = (!isnan(vehicleSpeedCached) && vehicleSpeedCached < 10.0f);
 		bool hasSpeed      = (!isnan(vehicleSpeedCached) && vehicleSpeedCached >= 10.0f);
+		bool canAlive      = !isnan(vehicleSpeedCached); // CAN läuft = Speed kommt an
 
-		if (slowOrStopped)
+		if (!isCornering && canAlive && vehicleSpeedCached > 0.5f)
 		{
-			// MODE 1: stopped – fast full correction
-			driftCancel += (leanDt / 1.0f) * (rawRoll - driftCancel);
-		}
-		else if (!isCornering)
-		{
-			// MODE 2: straight line – gravity reference reliable, correct τ = 4 s
+			// MODE 2: Geradeausfahrt, CAN bestätigt Bewegung – τ = 4 s
+			// Stillstand (Speed=0) oder kein CAN → einfrieren
 			driftCancel += (leanDt / 4.0f) * (rawRoll - driftCancel);
 		}
 		else if (hasSpeed)
