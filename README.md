@@ -1,6 +1,6 @@
 # Motorrad-Dash
 
-A custom motorcycle dashboard built on the **ESP32-S3 N16R8** (16 MB Flash, 8 MB OPI PSRAM), developed with PlatformIO and the Arduino framework. It displays real-time riding data on a 1.51" transparent OLED and integrates multiple sensors, a RaceBox Mini GPS logger, and a Blitzer-Warner radar detector.
+A custom motorcycle dashboard built on the **ESP32-S3 N16R8** (16 MB Flash, 8 MB OPI PSRAM), developed with PlatformIO and the Arduino framework. It displays real-time riding data on a 1.54" transparent OLED and integrates multiple sensors, a RaceBox Mini GPS logger, and a Blitzer-Warner radar detector.
 
 ---
 
@@ -80,7 +80,7 @@ Long press on any secondary page → back to primary group
 | OIL | Oil temp (°C), coolant temp (OBD2), outside temp, battery voltage | Open settings (hold 5 s) |
 | LEAN | Current lean angle, corner peak hold, all-time max L/R; CAN-offline badge top-right when OBD2 speed unavailable | Enter secondary group (800 ms); **2,5 s halten → L/R-Max zurücksetzen** |
 | G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Enter primary group (800 ms) |
-| ENGINE | RPM, coolant, load, throttle, speed, 0–100 km/h timer | Enter primary group (800 ms) |
+| ENGINE | RPM, coolant, load, throttle, speed, 0–100 km/h timer | Arm 0–100 timer when idle (800 ms); cancel timer + back to primary when timer active |
 | RACEBOX | GPS fix / BLE / recording status, auto-start recording | Enter primary group (800 ms) |
 
 ### Settings (OIL page hold 5 s)
@@ -134,10 +134,9 @@ The BNO085 uses `SH2_ARVR_STABILIZED_GRV` (no magnetometer) combined with a 4-mo
 
 | Mode | Condition | Action |
 |---|---|---|
-| 1 | Speed < 10 km/h (OBD2) | Fast correction τ = 1 s |
-| 2 | \|ω\| < 0.08 rad/s (going straight) | Correct τ = 4 s |
-| 3 | Cornering + OBD2 speed available | Physics model `θ = atan(v · ψ̇_earth / g)`, τ = 3 s |
-| 4 | Cornering, no OBD2 speed | Freeze drift estimate |
+| 1 | \|ω\| < 0.08 rad/s (going straight) + CAN active + Speed > 0.5 km/h | Correct τ = 4 s |
+| 2 | Cornering + OBD2 speed ≥ 10 km/h | Physics model `θ = atan(v · ψ̇_earth / g)`, τ = 3 s |
+| 3 | Cornering, no OBD2 speed | Freeze drift estimate |
 
 Mode 3 is the same principle used by OEM moto-IMUs (Bosch BMI / Continental 6DOF) — it computes the expected lean angle from vehicle speed and earth-frame yaw rate, allowing continuous drift correction even through repeated S-bends.
 

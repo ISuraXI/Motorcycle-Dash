@@ -8,7 +8,7 @@
     SDA  = GPIO 8
     SCL  = GPIO 9
 
-  OLED 1.54" (SD1309 / SSD1306-kompatibel) 128×64 – SPI2
+  OLED 1.54" (SSD1309 / SSD1306-kompatibel) 128×64 – SPI2
     DIN/MOSI = GPIO 11  (SPI2_MOSI)
     CLK/SCK  = GPIO 12  (SPI2_SCK)
     CS       = GPIO 10
@@ -84,6 +84,7 @@
 
 #include <U8g2_for_Adafruit_GFX.h>
 #include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 
 #include "driver/twai.h"
@@ -289,12 +290,6 @@ const bool ENABLE_ULTRADARK_INVERT = false;
 const float LUX_INVERT_ON = 3.0f;
 const float LUX_INVERT_OFF = 6.0f;
 
-// Sun-invert mode: in direct sunlight the OLED reflection washes out the dark
-// background. Inverting to white-bg/black-text means the reflection blends into
-// the bright background while the (non-emitting) black pixels stay dark → readable.
-const float LUX_SUN_INVERT_ON  = 8000.0f;  // ~bright overcast/sun → invert
-const float LUX_SUN_INVERT_OFF = 4000.0f;  // hysteresis: revert when clearly shaded
-bool sunInverted = false;
 
 float luxFiltered = 50.0f;
 float contrastF = (float)CONTRAST_DAY;
@@ -327,7 +322,6 @@ unsigned long raceboxRecLowSinceMs  = 0;
 unsigned long raceboxBtnUntilMs = 0;
 unsigned long raceboxBtnCooldownMs = 0; // prevent re-trigger while holding
 bool raceboxBtnArmed = true;            // only fire once per button press cycle
-#define RACEBOX_LONGPRESS_MS 250        // shorter long press threshold for RaceBox page
 
 // ---------------- Blitzer Warner ----------------
 #define BLITZER_PIN 14
@@ -499,21 +493,6 @@ float maxGSaved = 0.0f;
 float maxGBrake = 0.0f;   // session peak braking G (positive value)
 float maxGAccel = 0.0f;   // session peak acceleration G (positive value)
 
-// 4 Quadranten × 2 stärkste Peaks (RAM-only, weg beim Neustart)
-// Quadrant: 0=rechts/vorne (+x/+y), 1=links/vorne (-x/+y),
-//           2=links/hinten (-x/-y), 3=rechts/hinten (+x/-y)
-struct GFPeak { float x; float y; float mag; };
-GFPeak gQuadPeaks[4][2];  // [quadrant][slot 0=stärker, 1=schwächer]
-bool   gQuadHasSlot[4][2];
-
-static uint8_t gQuadrant(float gx, float gy)
-{
-	if (gx >= 0.0f && gy >= 0.0f) return 0;
-	if (gx <  0.0f && gy >= 0.0f) return 1;
-	if (gx <  0.0f && gy <  0.0f) return 2;
-	return 3;
-}
-
 // ---------------- EEPROM ----------------
 #define EEPROM_SIZE 32
 #define EE_MAGIC 0x42
@@ -583,7 +562,6 @@ static void drawBatteryTopRight();
 
 void drawLeanPage();
 
-void drawGCircle(float gx, float gy, float maxGVal);
 void drawGPage();
 void drawEnginePage();
 void drawRaceBoxPage();
@@ -723,7 +701,7 @@ bool loadMaxValues()
 			uint8_t eeBright = EEPROM.read(EE_SET_BRIGHT);
 			int8_t  eePitch  = (int8_t)EEPROM.read(EE_SET_PITCH_OFF);
 			int8_t  eeRoll   = (int8_t)EEPROM.read(EE_SET_ROLL_OFF);
-			brightMode     = (eeBright <= 2) ? eeBright : 0;
+			brightMode     = (eeBright <= 3) ? eeBright : 0;
 			leanFlip       = (eeFlip == 1);
 			pitchOffsetDeg = clampf((float)eePitch, -20.0f, 20.0f);
 			rollOffsetDeg  = clampf((float)eeRoll,  -20.0f, 20.0f);
@@ -753,17 +731,20 @@ bool loadMaxValues()
 	maxLeanRight  = clampf(maxLeanRight,  0.0f, 90.0f);
 	maxGSaved     = clampf(maxGSaved,     0.0f, 9.99f);
 
-	// EEPROM OK test: write/read/restore one byte
-	uint8_t old = EEPROM.read(EE_MAGIC_ADDR);
+	// EEPROM OK test: write/read/restore to scratch byte at addr 31 (unused end of block).
+	// Using a dedicated scratch address avoids corrupting EE_MAGIC_ADDR on an unexpected
+	// power-loss between the test-write and the restore-write.
+	const uint8_t EE_SCRATCH_ADDR = 31;
+	uint8_t old = EEPROM.read(EE_SCRATCH_ADDR);
 	uint8_t test = (uint8_t)(old ^ 0x5A);
 
-	EEPROM.write(EE_MAGIC_ADDR, test);
+	EEPROM.write(EE_SCRATCH_ADDR, test);
 	EEPROM.commit();
 	delay(2);
 
-	uint8_t rd = EEPROM.read(EE_MAGIC_ADDR);
+	uint8_t rd = EEPROM.read(EE_SCRATCH_ADDR);
 
-	EEPROM.write(EE_MAGIC_ADDR, old);
+	EEPROM.write(EE_SCRATCH_ADDR, old);
 	EEPROM.commit();
 
 	return (rd == test);
@@ -899,6 +880,19 @@ void buttonUpdate()
 	}
 
 	// ---- long press handling ----
+
+	// 2.5 s hold on LEAN page → reset L/R max lean (fires independently of longFired)
+	if (btn.pressed && !settingsOpen && page == PAGE_LEAN && !leanResetFired &&
+	    (now - btn.pressStartMs) >= 2500)
+	{
+		leanResetFired   = true;
+		maxLeanSaved     = 0.0f;
+		maxLeanLeft      = 0.0f;
+		maxLeanRight     = 0.0f;
+		maxDirty         = true;
+		resetAnimUntilMs = now + 350;
+	}
+
 	if (btn.pressed && !btn.longFired)
 	{
 		if (settingsOpen)
@@ -915,10 +909,10 @@ void buttonUpdate()
 					case SET_BRIGHTNESS:
 						brightMode = (brightMode + 1) % 4;
 						// apply immediately
-						if (brightMode == 1) { oledSetContrast(CONTRAST_DAY);   display.invertDisplay(false); sunInverted = false; }
-						else if (brightMode == 2) { oledSetContrast(CONTRAST_NIGHT); display.invertDisplay(false); sunInverted = false; }
-						else if (brightMode == 3) { oledSetContrast(CONTRAST_DAY);   display.invertDisplay(true);  sunInverted = true;  }
-						else                      { display.invertDisplay(false); sunInverted = false; } // Auto
+						if (brightMode == 1) { oledSetContrast(CONTRAST_DAY);   display.invertDisplay(false); }
+						else if (brightMode == 2) { oledSetContrast(CONTRAST_NIGHT); display.invertDisplay(false); }
+						else if (brightMode == 3) { oledSetContrast(CONTRAST_DAY);   display.invertDisplay(true);  }
+						else                      { display.invertDisplay(false); } // Auto
 						break;
 					case SET_PITCH_OFFSET:
 						// capture current sensor pitch as offset
@@ -983,17 +977,6 @@ void buttonUpdate()
 				return;
 			}
 
-			// 2.5 s hold on LEAN page → reset L/R max lean (fires even after longFired)
-			if (page == PAGE_LEAN && !leanResetFired && (now - btn.pressStartMs) >= 2500)
-			{
-				leanResetFired   = true;
-				maxLeanSaved     = 0.0f;
-				maxLeanLeft      = 0.0f;
-				maxLeanRight     = 0.0f;
-				maxDirty         = true;
-				resetAnimUntilMs = now + 350;
-			}
-
 			if ((now - btn.pressStartMs) >= LONGPRESS_MS)
 			{
 				btn.longFired = true;
@@ -1006,9 +989,26 @@ void buttonUpdate()
 					page              = lastSecondaryPage;
 					resetAnimUntilMs  = 0;
 				}
+				else if (page == PAGE_ENGINE)
+				{
+					if (sprint100State == S100_IDLE)
+					{
+						// Arm the 0-100 timer (hold to arm as shown on display)
+						sprint100State = S100_ARMED;
+					}
+					else
+					{
+						// Cancel timer and go back to primary
+						sprint100State    = S100_IDLE;
+						lastSecondaryPage = page;
+						primaryGroup      = true;
+						page              = lastPrimaryPage;
+						resetAnimUntilMs  = 0;
+					}
+				}
 				else
 				{
-					// Any secondary page long press → back to primary group
+					// Any other secondary page long press → back to primary group
 					lastSecondaryPage = page;
 					primaryGroup      = true;
 					page              = lastPrimaryPage;
@@ -1151,7 +1151,7 @@ void updateCan()
 		switch (resp.data[2])
 		{
 			case 0x05: coolantTempCached  = (float)(resp.data[3]) - 40.0f; break;
-			case 0x0C: engineRpmCached    = (float)((resp.data[3] << 8) | resp.data[4]) / 4.0f; break;
+			case 0x0C: engineRpmCached    = (float)(((uint16_t)resp.data[3] << 8) | resp.data[4]) / 4.0f; break;
 			case 0x04: engineLoadCached   = (float)(resp.data[3]) * 100.0f / 255.0f; break;
 			case 0x11: throttlePosCached  = (float)(resp.data[3]) * 100.0f / 255.0f; break;
 			case 0x0D: vehicleSpeedCached = (float)(resp.data[3]); break;
@@ -1440,7 +1440,7 @@ void updateCurvePeakHold(float leanAbs)
 	if (cornerPeak >= CENTER_PEAK_THRESHOLD)
 	{
 		// Only re-enable peak display if the decline timer hasn't already expired.
-		// Without this guard, returning above 15° after 4+ seconds at lower angle
+		// Without this guard, returning above 30° after 4+ seconds at lower angle
 		// would re-activate cornerAboveThreshold and show the old peak (e.g. 26°)
 		// instead of the current live lean angle.
 		bool alreadyExpired = cornerDeclineStartMs != 0 &&
@@ -1677,23 +1677,6 @@ void updateGForce()
 	// Brake / accel peak (longitudinal axis only)
 	if (gYFast < 0.0f && -gYFast > maxGBrake) maxGBrake = -gYFast;
 	if (gYFast > 0.0f &&  gYFast > maxGAccel) maxGAccel =  gYFast;
-	// Quadranten-Peak-Puffer aktualisieren
-	{
-		uint8_t q = gQuadrant(gXFast, gYFast);
-		GFPeak np = { gXFast, gYFast, mag };
-		if (!gQuadHasSlot[q][0] || mag > gQuadPeaks[q][0].mag)
-		{
-			gQuadPeaks[q][1] = gQuadPeaks[q][0];
-			gQuadHasSlot[q][1] = gQuadHasSlot[q][0];
-			gQuadPeaks[q][0] = np;
-			gQuadHasSlot[q][0] = true;
-		}
-		else if (!gQuadHasSlot[q][1] || mag > gQuadPeaks[q][1].mag)
-		{
-			gQuadPeaks[q][1] = np;
-			gQuadHasSlot[q][1] = true;
-		}
-	}
 }
 
 void updateSprint100()
@@ -1777,8 +1760,8 @@ void updateNightMode()
 		}
 	}
 
-	// Sun-invert: only in Auto mode if explicitly enabled via brightMode==3 (Sonne)
-	// In Auto mode we only adjust contrast, never invert.
+	// Sonne mode (brightMode==3) inverts the display; this is handled in the
+	// settings handler when the mode is changed. Auto mode only adjusts contrast.
 }
 
 // =========================================================
@@ -1866,7 +1849,7 @@ void drawLeanSemiGauge(float rollDeg)
 		float offset = fabs((float)a - 90.0f);
 		float degHere = (offset / 90.0f) * maxDeg;
 
-		float rad = a * 3.1415926f / 180.0f;
+		float rad = a * (float)(M_PI / 180.0);
 
 		int16_t x1p = cx + (int16_t)roundf(cosf(rad) * r);
 		int16_t y1p = cy - (int16_t)roundf(sinf(rad) * r);
@@ -1909,8 +1892,8 @@ void drawLeanSemiGauge(float rollDeg)
 			for (float a = a0; a >= a1; a -= step)
 			{
 				float aPrev = a + step;
-				float r1 = a * 3.1415926f / 180.0f;
-				float r2 = aPrev * 3.1415926f / 180.0f;
+				float r1 = a * (float)(M_PI / 180.0);
+				float r2 = aPrev * (float)(M_PI / 180.0);
 
 				int16_t xA = cx + (int16_t)roundf(cosf(r1) * (r - 3));
 				int16_t yA = cy - (int16_t)roundf(sinf(r1) * (r - 3));
@@ -1925,8 +1908,8 @@ void drawLeanSemiGauge(float rollDeg)
 			for (float a = a0; a <= a1; a += step)
 			{
 				float aPrev = a - step;
-				float r1 = a * 3.1415926f / 180.0f;
-				float r2 = aPrev * 3.1415926f / 180.0f;
+				float r1 = a * (float)(M_PI / 180.0);
+				float r2 = aPrev * (float)(M_PI / 180.0);
 
 				int16_t xA = cx + (int16_t)roundf(cosf(r1) * (r - 3));
 				int16_t yA = cy - (int16_t)roundf(sinf(r1) * (r - 3));
@@ -1937,7 +1920,7 @@ void drawLeanSemiGauge(float rollDeg)
 			}
 		}
 
-		float needleAng = a1 * 3.1415926f / 180.0f;
+		float needleAng = a1 * (float)(M_PI / 180.0);
 		int16_t nx = cx + (int16_t)roundf(cosf(needleAng) * (r - 1));
 		int16_t ny = cy - (int16_t)roundf(sinf(needleAng) * (r - 1));
 		display.drawLine(cx, cy, nx, ny, SSD1306_WHITE);
@@ -2286,91 +2269,6 @@ void drawLeanPage()
 // =========================================================
 // G page
 // =========================================================
-void drawGCircle(float gx, float gy, float maxGVal)
-{
-	const int16_t cx = 64;
-	const int16_t cy = 32;
-	const int16_t r  = 26;
-	const float rangeG = 1.5f;
-
-	// Fadenkreuz (volle Achslinien)
-	display.drawLine(cx - r, cy, cx + r, cy, SSD1306_WHITE);
-	display.drawLine(cx, cy - r, cx, cy + r, SSD1306_WHITE);
-	// äußerer Ring: 1.5g
-	display.drawCircle(cx, cy, r, SSD1306_WHITE);
-	// innerer Ring: 0.75g
-	const int16_t rInner = (int16_t)lroundf((float)r * 0.5f);
-	display.drawCircle(cx, cy, rInner, SSD1306_WHITE);
-
-	// Ring-Legende: nur am äußeren Ring
-	display.setFont();
-	display.setTextSize(1);
-	display.setCursor(cx + r + 2, cy - 4);
-	display.print("1.5g");
-
-	// Peak-Marker: Punkte nach Winkel sortieren → sauberes Polygon
-	{
-		int16_t ptx[8], pty[8];
-		float   pta[8]; // Winkel für Sortierung
-		uint8_t ptCount = 0;
-		for (uint8_t q = 0; q < 4; q++)
-		{
-			for (uint8_t s = 0; s < 2; s++)
-			{
-				if (!gQuadHasSlot[q][s]) continue;
-				float px_f = clampf(gQuadPeaks[q][s].x, -rangeG, rangeG);
-				float py_f = clampf(gQuadPeaks[q][s].y, -rangeG, rangeG);
-				ptx[ptCount] = cx + (int16_t)lroundf((px_f / rangeG) * (float)(r - 2));
-				pty[ptCount] = cy - (int16_t)lroundf((py_f / rangeG) * (float)(r - 2));
-				pta[ptCount] = atan2f(py_f, px_f); // Winkel für Sortierung
-				ptCount++;
-			}
-		}
-		// Insertion-Sort nach Winkel (max 8 Elemente → kein Overhead)
-		for (uint8_t i = 1; i < ptCount; i++)
-		{
-			int16_t kx = ptx[i], ky = pty[i]; float ka = pta[i];
-			int8_t j = (int8_t)i - 1;
-			while (j >= 0 && pta[j] > ka)
-			{
-				ptx[j+1] = ptx[j]; pty[j+1] = pty[j]; pta[j+1] = pta[j];
-				j--;
-			}
-			ptx[j+1] = kx; pty[j+1] = ky; pta[j+1] = ka;
-		}
-		// Polygon zeichnen
-		for (uint8_t i = 0; i < ptCount; i++)
-		{
-			uint8_t j = (i + 1) % ptCount;
-			display.drawLine(ptx[i], pty[i], ptx[j], pty[j], SSD1306_WHITE);
-		}
-		// Punkte obendrauf
-		for (uint8_t i = 0; i < ptCount; i++)
-			display.drawCircle(ptx[i], pty[i], 2, SSD1306_WHITE);
-	}
-
-	// Aktuellen Punkt pushen + zeichnen
-	float x = clampf(gx, -rangeG, rangeG);
-	float y = clampf(gy, -rangeG, rangeG);
-	int16_t dx = cx + (int16_t)lroundf((x / rangeG) * (float)(r - 2));
-	int16_t dy = cy - (int16_t)lroundf((y / rangeG) * (float)(r - 2));
-	display.fillCircle(dx, dy, 3, SSD1306_WHITE);
-
-	// Texte
-	display.setFont();
-	display.setTextSize(1);
-
-	float mag = sqrtf(gx * gx + gy * gy);
-	display.setCursor(1, 0);
-	display.print(mag, 1);
-	display.print("g");
-
-	display.setCursor(1, display.height() - 9);
-	display.print("M:");
-	display.print(maxGVal, 1);
-	display.print("g");
-}
-
 void drawGPage()
 {
 	display.clearDisplay();
@@ -2387,7 +2285,7 @@ void drawGPage()
 	// ---- Large current G value (kein "g") ----
 	char gBuf[8];
 	snprintf(gBuf, sizeof(gBuf), "%.2f", fabsf(gY));
-	display.setFont(&FreeSansBold18pt7b);
+	display.setFont(&FreeSansBold12pt7b);
 	int16_t bx, by; uint16_t bw, bh;
 	display.getTextBounds(gBuf, 0, 0, &bx, &by, &bw, &bh);
 	display.setCursor((SCREEN_WIDTH - (int16_t)bw) / 2 - bx, 36);
@@ -2416,6 +2314,20 @@ void drawGPage()
 			else            // Gas: links
 				display.fillRect(BAR_CX - fillW, BAR_Y + 1, fillW, BAR_H - 2, SSD1306_WHITE);
 		}
+	}
+
+	// ---- Peak tick marks on the bar ----
+	if (maxGBrake > 0.01f)
+	{
+		int16_t bx = BAR_CX + (int16_t)((maxGBrake / BAR_G) * (float)BAR_HW);
+		if (bx > BAR_CX + BAR_HW - 1) bx = BAR_CX + BAR_HW - 1;
+		display.drawFastVLine(bx, BAR_Y - 2, BAR_H + 4, SSD1306_WHITE);
+	}
+	if (maxGAccel > 0.01f)
+	{
+		int16_t ax = BAR_CX - (int16_t)((maxGAccel / BAR_G) * (float)BAR_HW);
+		if (ax < BAR_CX - BAR_HW + 1) ax = BAR_CX - BAR_HW + 1;
+		display.drawFastVLine(ax, BAR_Y - 2, BAR_H + 4, SSD1306_WHITE);
 	}
 
 	// ---- Peak values ----
