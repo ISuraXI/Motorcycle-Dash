@@ -416,6 +416,7 @@ uint8_t settingsIdx = 0;
 unsigned long settingsLastActMs = 0; // last interaction time (for timeout)
 bool settingsLongFired = false;    // long-press-in-settings already fired
 bool leanResetFired    = false;    // 2.5 s hold on LEAN page → reset L/R max
+bool gResetFired       = false;    // 2.5 s hold on G page → reset brake/accel peaks
 unsigned long settingsPressStartMs = 0;
 bool settingsEnterReleasePending = false; // ignore first release after entering settings
 
@@ -830,6 +831,7 @@ void buttonUpdate()
 			btn.longFired = false;
 			settingsLongFired = false;
 			leanResetFired = false;
+			gResetFired = false;
 			settingsPressStartMs = now;
 		}
 		else
@@ -866,6 +868,22 @@ void buttonUpdate()
 					}
 					resetAnimUntilMs = 0;
 				}
+				else if (btn.pressed && btn.longFired && !primaryGroup && page == PAGE_G && !gResetFired)
+				{
+					// Deferred G switch: released after 800ms but before 2.5s reset → back to primary group
+					lastSecondaryPage = PAGE_G;
+					primaryGroup      = true;
+					page              = lastPrimaryPage;
+					resetAnimUntilMs  = 0;
+				}
+				else if (btn.pressed && btn.longFired && primaryGroup && page == PAGE_LEAN && !leanResetFired)
+				{
+					// Deferred LEAN switch: released after 800ms but before 2.5s reset → enter secondary group
+					lastPrimaryPage  = PAGE_LEAN;
+					primaryGroup     = false;
+					page             = lastSecondaryPage;
+					resetAnimUntilMs = 0;
+				}
 				raceboxBtnArmed = true; // re-arm after button fully released
 			}
 			btn.pressed = false;
@@ -890,6 +908,16 @@ void buttonUpdate()
 		maxLeanLeft      = 0.0f;
 		maxLeanRight     = 0.0f;
 		maxDirty         = true;
+		resetAnimUntilMs = now + 350;
+	}
+
+	// 2.5 s hold on G page → reset brake/accel peaks (fires independently of longFired)
+	if (btn.pressed && !settingsOpen && page == PAGE_G && !gResetFired &&
+	    (now - btn.pressStartMs) >= 2500)
+	{
+		gResetFired      = true;
+		maxGBrake        = 0.0f;
+		maxGAccel        = 0.0f;
 		resetAnimUntilMs = now + 350;
 	}
 
@@ -983,11 +1011,8 @@ void buttonUpdate()
 
 				if (page == PAGE_LEAN)
 				{
-					// LEAN long press → enter secondary group
-					lastPrimaryPage   = PAGE_LEAN;
-					primaryGroup      = false;
-					page              = lastSecondaryPage;
-					resetAnimUntilMs  = 0;
+					// LEAN: page switch is deferred to button release so that
+					// holding to 2.5 s can still trigger the lean-max reset.
 				}
 				else if (page == PAGE_ENGINE)
 				{
@@ -1006,13 +1031,20 @@ void buttonUpdate()
 						resetAnimUntilMs  = 0;
 					}
 				}
-				else
+				else if (page == PAGE_G)
 				{
-					// Any other secondary page long press → back to primary group
-					lastSecondaryPage = page;
-					primaryGroup      = true;
-					page              = lastPrimaryPage;
-					resetAnimUntilMs  = 0;
+					// G page: page switch is deferred to button release so that
+					// holding to 2.5 s can still trigger the peak reset.
+				}
+				else if (page == PAGE_RACEBOX)
+				{
+					// RACEBOX: simulate RaceBox button press via NPN transistor
+					if (raceboxBtnArmed)
+					{
+						raceboxBtnArmed   = false;
+						digitalWrite(RACEBOX_BTN_PIN, HIGH);
+						raceboxBtnUntilMs = now + 250;
+					}
 				}
 			}
 		}
@@ -1572,16 +1604,26 @@ void updateLean()
 		float omegaSq = bno085GyroX*bno085GyroX
 		              + bno085GyroY*bno085GyroY
 		              + bno085GyroZ*bno085GyroZ;
+
+		// Vibration filter: EMA-smooth the gyro magnitude so that high-frequency
+		// frame vibrations (< ~100 ms bursts) don't falsely flag "cornering".
+		// τ = 0.25 s → a real corner onset (~0.5 s) passes through cleanly.
+		static float omegaSqFiltered = 0.0f;
+		const float OMEGA_VIB_TAU = 0.25f;
+		float omegaAlpha = clampf(leanDt / OMEGA_VIB_TAU, 0.0f, 1.0f);
+		omegaSqFiltered += omegaAlpha * (omegaSq - omegaSqFiltered);
+
 		const float OMEGA_CORNER  = 0.08f; // rad/s threshold: below = going straight
-		bool isCornering   = (omegaSq > OMEGA_CORNER * OMEGA_CORNER);
+		bool isCornering   = (omegaSqFiltered > OMEGA_CORNER * OMEGA_CORNER);
 		bool hasSpeed      = (!isnan(vehicleSpeedCached) && vehicleSpeedCached >= 10.0f);
 		bool canAlive      = !isnan(vehicleSpeedCached); // CAN läuft = Speed kommt an
 
 		if (!isCornering && canAlive && vehicleSpeedCached > 0.5f)
 		{
-			// MODE 2: Geradeausfahrt, CAN bestätigt Bewegung – τ = 4 s
+			// MODE 2: Geradeausfahrt, CAN bestätigt Bewegung – τ = 2.5 s
+			// (verkürzt von 4 s: schnellere Nachkorrektur nach Vibrations-bedingtem Drift)
 			// Stillstand (Speed=0) oder kein CAN → einfrieren
-			driftCancel += (leanDt / 4.0f) * (rawRoll - driftCancel);
+			driftCancel += (leanDt / 2.5f) * (rawRoll - driftCancel);
 		}
 		else if (hasSpeed)
 		{
@@ -1954,10 +1996,10 @@ void drawHatchedRect(int x, int y, int w, int h, int spacing)
 	}
 }
 
-// Redline border flash at >= 10500 rpm – drawn on every page before display.display()
+// Redline border flash at >= 9500 rpm – drawn on every page before display.display()
 void drawRpmRedlineBorder()
 {
-	if (!isnan(engineRpmCached) && engineRpmCached >= 10500.0f)
+	if (!isnan(engineRpmCached) && engineRpmCached >= 9500.0f)
 	{
 		if (((millis() / 80) % 2) == 0)
 		{
