@@ -227,6 +227,8 @@ float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text
 // When active: sensors cycle through normal range, warnings NOT triggered
 // Use TEST_MODE_WARNINGS to also test warning screens
 // #define TEST_MODE_WARNINGS
+// Main demo: fixed oil/batt/temp, lean oscillates 0→41→0 (pause 8s) 0→-51→0 (pause 8s)
+// #define TEST_MODE_MAIN
 
 // ---------------- one‑wire / outside temp ----------------
 #define ONE_WIRE_PIN 7
@@ -270,6 +272,7 @@ float DS18B20_OFFSET = -1.2f;
 float battVoltageCached = NAN;
 const float BATT_EMA_ALPHA = 0.3f;
 const float BATT_SPIKE_REJECT_V = 0.25f; // ignore single-sample spikes >0.25V
+uint8_t cpuLoadPct = 0; // main-loop CPU load estimate (0–100%)
 
 // round-robin ADS1115 scheduling: one read per loop, rotate channels
 // slot 0 = oil (ADS ch0), slot 1 = Blitzer alive (ADS ch1), slot 2 = battery (ADS ch2)
@@ -299,7 +302,7 @@ unsigned long lastContrastPushMs = 0;
 // ---------------- Pages ----------------
 enum Page : uint8_t
 {
-	PAGE_OIL = 0,
+	PAGE_MAIN = 0,        // main/oil page (big number + oil bar)
 	PAGE_LEAN = 1,
 	PAGE_G = 2,
 	PAGE_ENGINE = 3,
@@ -364,11 +367,11 @@ unsigned long raceboxRecHighSinceMs = 0;
 #define RACEBOX_PIN_VALID_HIGH_REC_MS     2000
 unsigned long raceboxBleAliveLastMs = 0;   // last time BLE pin was LOW after PinOk (= RaceBox is on)
 #define RACEBOX_BLE_ALIVE_TIMEOUT_MS 10000 // show "ON" for 10s after last blink
-Page page = PAGE_OIL;
+Page page = PAGE_MAIN;
 
 // Two-group navigation: primary (OIL/LEAN) and secondary (G/ENGINE/RACEBOX)
 bool primaryGroup       = true;       // true = in primary group
-Page lastPrimaryPage    = PAGE_OIL;   // remembered when leaving primary
+Page lastPrimaryPage    = PAGE_MAIN; // remembered when leaving primary
 Page lastSecondaryPage  = PAGE_G;     // remembered when leaving secondary
 
 #define BTN_PIN  4
@@ -400,7 +403,7 @@ enum SettingsItem : uint8_t {
 	SET_LEAN_FLIP,        // invert lean angle direction
 	SET_LEAN_OFFSET,      // capture current roll as lean zero offset
 	SET_PITCH_OFFSET,     // sensor pitch correction for G-force
-	SET_RESET_LEAN,       // reset all-time lean max L/R (moved from long press on LEAN)
+	SET_RESET_ALL,        // reset lean max L/R AND G-force peaks
 	SET_DS18_OFFSET,      // DS18B20 temperature calibration offset
 	SET_BATT_LOW,         // battery low warning threshold
 	SET_G_DEADZONE,       // G-force vibration deadzone
@@ -410,13 +413,10 @@ enum SettingsItem : uint8_t {
 // Brightness mode: 0=Auto (BH1750), 1=Tag (always max), 2=Nacht (always min), 3=Sonne (forced invert)
 uint8_t brightMode = 0;
 bool leanFlip = false;  // true = invert roll direction (sensor mounted mirrored)
-
 bool settingsOpen = false;
 uint8_t settingsIdx = 0;
 unsigned long settingsLastActMs = 0; // last interaction time (for timeout)
 bool settingsLongFired = false;    // long-press-in-settings already fired
-bool leanResetFired    = false;    // 2.5 s hold on LEAN page → reset L/R max
-bool gResetFired       = false;    // 2.5 s hold on G page → reset brake/accel peaks
 unsigned long settingsPressStartMs = 0;
 bool settingsEnterReleasePending = false; // ignore first release after entering settings
 
@@ -461,6 +461,10 @@ const float LEAN_DEADZONE_DEG = 2.0f;
 float maxLeanSaved = 0.0f;
 float maxLeanLeft  = 0.0f;
 float maxLeanRight = 0.0f;
+
+// Session-only max (reset on power-off, not persisted)
+float sessionMaxLeanLeft  = 0.0f;
+float sessionMaxLeanRight = 0.0f;
 
 // Curve Peak Hold
 float cornerPeak = 0.0f;
@@ -512,6 +516,7 @@ float maxGAccel = 0.0f;   // session peak acceleration G (positive value)
 #define EE_SET_LEAN_FLIP 13  // uint8_t 0/1
 #define EE_SET_PITCH_OFF 15  // int8_t  degrees -20..+20
 #define EE_SET_ROLL_OFF  16  // int8_t  degrees -20..+20
+#define EE_SET_MAIN     17  // uint8_t 0/1 – Main Page 2 mode
 
 bool maxDirty = false;
 unsigned long lastEESaveMs = 0;
@@ -555,8 +560,8 @@ void drawCenteredTitleTiny(const char *text, int16_t baselineY);
 void drawLeanSemiGauge(float rollDeg);
 
 void drawHatchedRect(int x, int y, int w, int h, int spacing = 3);
-void drawOilBar(float oilC);
-void drawOilPage(float oilC);
+void drawOilBar(float oilC, int barX = 10, int barW = 108);
+void drawMainPage();
 void drawBlitzerWarnerAliveIndicator();
 void drawRpmRedlineBorder();
 static void drawBatteryTopRight();
@@ -644,6 +649,23 @@ static float triangleWave(float lo, float hi, unsigned long periodMs)
 		? (float)t / half
 		: 1.0f - ((float)(t - (unsigned long)half) / half);
 	return lo + frac * (hi - lo);
+}
+
+// Smooth lean demo: 0→41→0 (6s), pause 8s, 0→−51→0 (6s), pause 8s
+static float leanTestWave()
+{
+	const unsigned long sweepMs = 6000UL;
+	const unsigned long waitMs  = 8000UL;
+	const unsigned long period  = sweepMs * 2UL + waitMs * 2UL; // 28s
+	unsigned long t = millis() % period;
+	if (t < sweepMs)
+		return 41.0f * sinf((float)t / sweepMs * (float)M_PI);
+	else if (t < sweepMs + waitMs)
+		return 0.0f;
+	else if (t < sweepMs * 2UL + waitMs)
+		return -51.0f * sinf((float)(t - sweepMs - waitMs) / sweepMs * (float)M_PI);
+	else
+		return 0.0f;
 }
 
 static float clampf(float v, float lo, float hi)
@@ -830,8 +852,6 @@ void buttonUpdate()
 			btn.pressStartMs = now;
 			btn.longFired = false;
 			settingsLongFired = false;
-			leanResetFired = false;
-			gResetFired = false;
 			settingsPressStartMs = now;
 		}
 		else
@@ -858,7 +878,7 @@ void buttonUpdate()
 					// Cycle within current navigation group
 					if (primaryGroup)
 					{
-						page = (page == PAGE_OIL) ? PAGE_LEAN : PAGE_OIL;
+						page = (page == PAGE_MAIN) ? PAGE_LEAN : PAGE_MAIN;
 					}
 					else
 					{
@@ -868,22 +888,7 @@ void buttonUpdate()
 					}
 					resetAnimUntilMs = 0;
 				}
-				else if (btn.pressed && btn.longFired && !primaryGroup && page == PAGE_G && !gResetFired)
-				{
-					// Deferred G switch: released after 800ms but before 2.5s reset → back to primary group
-					lastSecondaryPage = PAGE_G;
-					primaryGroup      = true;
-					page              = lastPrimaryPage;
-					resetAnimUntilMs  = 0;
-				}
-				else if (btn.pressed && btn.longFired && primaryGroup && page == PAGE_LEAN && !leanResetFired)
-				{
-					// Deferred LEAN switch: released after 800ms but before 2.5s reset → enter secondary group
-					lastPrimaryPage  = PAGE_LEAN;
-					primaryGroup     = false;
-					page             = lastSecondaryPage;
-					resetAnimUntilMs = 0;
-				}
+
 				raceboxBtnArmed = true; // re-arm after button fully released
 			}
 			btn.pressed = false;
@@ -899,27 +904,6 @@ void buttonUpdate()
 
 	// ---- long press handling ----
 
-	// 2.5 s hold on LEAN page → reset L/R max lean (fires independently of longFired)
-	if (btn.pressed && !settingsOpen && page == PAGE_LEAN && !leanResetFired &&
-	    (now - btn.pressStartMs) >= 2500)
-	{
-		leanResetFired   = true;
-		maxLeanSaved     = 0.0f;
-		maxLeanLeft      = 0.0f;
-		maxLeanRight     = 0.0f;
-		maxDirty         = true;
-		resetAnimUntilMs = now + 350;
-	}
-
-	// 2.5 s hold on G page → reset brake/accel peaks (fires independently of longFired)
-	if (btn.pressed && !settingsOpen && page == PAGE_G && !gResetFired &&
-	    (now - btn.pressStartMs) >= 2500)
-	{
-		gResetFired      = true;
-		maxGBrake        = 0.0f;
-		maxGAccel        = 0.0f;
-		resetAnimUntilMs = now + 350;
-	}
 
 	if (btn.pressed && !btn.longFired)
 	{
@@ -961,10 +945,12 @@ void buttonUpdate()
 						rollOffsetDeg = clampf(bno085Roll - ROLL_MOUNT_OFFSET_DEG, -20.0f, 20.0f);
 						maxDirty = true;
 						break;
-					case SET_RESET_LEAN:
+					case SET_RESET_ALL:
 						maxLeanSaved = 0.0f;
 						maxLeanLeft  = 0.0f;
 						maxLeanRight = 0.0f;
+						maxGBrake    = 0.0f;
+						maxGAccel    = 0.0f;
 						maxDirty = true;
 						resetAnimUntilMs = now + 350;
 						break;
@@ -990,10 +976,10 @@ void buttonUpdate()
 		else
 		{
 			// ---- normal long press ----
-			// OIL: 5s → settings (unchanged, no other action on this page)
-			if (page == PAGE_OIL)
+			// MAIN: 800ms → settings
+			if (page == PAGE_MAIN)
 			{
-				if (!btn.longFired && (now - btn.pressStartMs) >= SETTINGS_OPEN_MS)
+				if (!btn.longFired && (now - btn.pressStartMs) >= LONGPRESS_MS)
 				{
 					btn.longFired = true;
 					settingsOpen  = true;
@@ -1011,19 +997,22 @@ void buttonUpdate()
 
 				if (page == PAGE_LEAN)
 				{
-					// LEAN: page switch is deferred to button release so that
-					// holding to 2.5 s can still trigger the lean-max reset.
+					// LEAN: long press → enter secondary group
+					lastPrimaryPage  = PAGE_LEAN;
+					primaryGroup     = false;
+					page             = lastSecondaryPage;
+					resetAnimUntilMs = 0;
 				}
 				else if (page == PAGE_ENGINE)
 				{
 					if (sprint100State == S100_IDLE)
 					{
-						// Arm the 0-100 timer (hold to arm as shown on display)
+						// Arm the 0-100 timer
 						sprint100State = S100_ARMED;
 					}
 					else
 					{
-						// Cancel timer and go back to primary
+						// Cancel and go back to primary
 						sprint100State    = S100_IDLE;
 						lastSecondaryPage = page;
 						primaryGroup      = true;
@@ -1033,8 +1022,11 @@ void buttonUpdate()
 				}
 				else if (page == PAGE_G)
 				{
-					// G page: page switch is deferred to button release so that
-					// holding to 2.5 s can still trigger the peak reset.
+					// G: long press → back to primary group
+					lastSecondaryPage = PAGE_G;
+					primaryGroup      = true;
+					page              = lastPrimaryPage;
+					resetAnimUntilMs  = 0;
 				}
 				else if (page == PAGE_RACEBOX)
 				{
@@ -1682,6 +1674,12 @@ void updateLean()
 		maxDirty = true;
 	}
 
+	// Session-only tracking (not persisted)
+	if (rollFiltered < -LEAN_DEADZONE_DEG && leanAbs > sessionMaxLeanLeft)
+		sessionMaxLeanLeft = leanAbs;
+	if (rollFiltered > LEAN_DEADZONE_DEG && leanAbs > sessionMaxLeanRight)
+		sessionMaxLeanRight = leanAbs;
+
 	updateCurvePeakHold(leanAbs);
 }
 
@@ -2026,11 +2024,11 @@ void drawBlitzerWarnerAliveIndicator()
 	}
 }
 
-void drawOilBar(float oilC)
+void drawOilBar(float oilC, int barX, int barW)
 {
-	const int x = 10;
+	const int x = barX;
 	const int y = 56;
-	const int w = 108;
+	const int w = barW;
 	const int h = 6;
 
 	display.drawRect(x, y, w, h, SSD1306_WHITE);
@@ -2109,8 +2107,37 @@ static void drawBatteryTopRight()
 	display.print(buf);
 }
 
-void drawOilPage(float oilC)
+// =========================================================
+// Main Page 2  (oil page; center number auto-switches to lean at >= 25°)
+// =========================================================
+void drawMainPage()
 {
+	static bool mainLeanActive   = false;
+	static unsigned long mainLeanBelowMs = 0;
+
+	const float MAIN_LEAN_THRESHOLD = 25.0f;
+	const unsigned long MAIN_LEAN_HOLD_MS = 4000;
+
+	float leanAbs = fabsf(rollUi);
+
+	if (leanAbs >= MAIN_LEAN_THRESHOLD)
+	{
+		mainLeanActive  = true;
+		mainLeanBelowMs = 0;
+	}
+	else if (mainLeanActive)
+	{
+		if (mainLeanBelowMs == 0)
+			mainLeanBelowMs = millis();
+		if ((millis() - mainLeanBelowMs) >= MAIN_LEAN_HOLD_MS)
+		{
+			mainLeanActive  = false;
+			mainLeanBelowMs = 0;
+		}
+	}
+
+	float oilC = oilTempCached;
+
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
 
@@ -2123,7 +2150,6 @@ void drawOilPage(float oilC)
 		display.print(outsideTemp, 1);
 		int16_t otDegX = display.getCursorX();
 		display.drawCircle(otDegX + 2, 1, 1, SSD1306_WHITE);
-		// ice warning: snowflake when at or below 0°C
 		if (outsideTemp <= 0.0f)
 			drawSnowflakeWarning(otDegX + 8, 5);
 	}
@@ -2141,7 +2167,17 @@ void drawOilPage(float oilC)
 	}
 
 	int16_t baselineY = 41;
-	if (isnan(oilC))
+	if (mainLeanActive)
+	{
+		// Show lean angle without degree symbol
+		display.setFont(&FreeSansBold18pt7b);
+		String leanStr = String((int)round(leanAbs));
+		int16_t lx1, ly1; uint16_t lw, lh;
+		display.getTextBounds(leanStr, 0, baselineY, &lx1, &ly1, &lw, &lh);
+		display.setCursor((display.width() - (int16_t)lw) / 2, baselineY);
+		display.print(leanStr);
+	}
+	else if (isnan(oilC))
 	{
 		display.setFont(&FreeSansBold18pt7b);
 		String s = "--";
@@ -2151,49 +2187,20 @@ void drawOilPage(float oilC)
 		int16_t x = (display.width() - (int16_t)w) / 2;
 		display.setCursor(x, baselineY);
 		display.print(s);
-		// debug: show reason below title, above bar
-		#if OIL_DEBUG
-		display.setFont();
-		display.setTextSize(1);
-		display.setCursor(0, 20);
-		if (!adsOk)
-			display.print("ADS:FAIL");
-		else if (isnan(dbgOilVoltage))
-			display.print("V:NaN");
-		else
-		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
-		#endif
 	}
 	else
 	{
-		// Hysteresis: step ±1 only when float moves >0.6°C past current integer → never skips a digit
-		static int shownOilInt = INT_MIN;
-		if (shownOilInt == INT_MIN)
-			shownOilInt = (int)round(oilC);
-		else if (oilC > (float)shownOilInt + 0.6f)
-			shownOilInt++;
-		else if (oilC < (float)shownOilInt - 0.6f)
-			shownOilInt--;
-		drawCenteredBigNumberWithDegree(shownOilInt, baselineY);
-		#if OIL_DEBUG
+		static int shownOilInt2 = INT_MIN;
+		if (shownOilInt2 == INT_MIN)
+			shownOilInt2 = (int)round(oilC);
+		else if (oilC > (float)shownOilInt2 + 0.6f)
+			shownOilInt2++;
+		else if (oilC < (float)shownOilInt2 - 0.6f)
+			shownOilInt2--;
+		drawCenteredBigNumberWithDegree(shownOilInt2, baselineY);
+
 		display.setFont();
 		display.setTextSize(1);
-		display.setCursor(0, 20);
-		if (!adsOk)
-			display.print("ADS:FAIL");
-		else if (isnan(dbgOilVoltage))
-			display.print("V:NaN");
-		else
-		{ char dbgBuf[16]; snprintf(dbgBuf, sizeof(dbgBuf), "V:%.3f", dbgOilVoltage); display.print(dbgBuf); }
-		#endif
-	}
-
-	display.setFont();
-	display.setTextSize(1);
-
-	// status text: COLD below range only
-	if (!isnan(oilC))
-	{
 		display.setCursor(2, 46);
 		if (oilC < 60.0f)
 			display.print("COLD");
@@ -2202,16 +2209,38 @@ void drawOilPage(float oilC)
 	drawBatteryTopRight();
 
 	drawOilBar(oilC);
+
 	drawBlitzerWarnerAliveIndicator();
 
-	// hold-progress bar: grows left→right while button held, shows 5s entry progress
-	if (btn.pressed)
+	// lean-active border: static 2px frame so rider immediately sees "lean mode"
+	if (mainLeanActive)
+	{
+		display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+		display.drawRect(1, 1, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2, SSD1306_WHITE);
+	}
+
+	// hold-progress bar: 800ms entry (same as standard long-press)
+	if (btn.pressed && !mainLeanActive)
 	{
 		unsigned long held = millis() - btn.pressStartMs;
-		int barW = (int)((float)held / (float)SETTINGS_OPEN_MS * 126.0f);
+		int barW = (int)((float)held / (float)LONGPRESS_MS * 126.0f);
 		if (barW > 126) barW = 126;
 		if (barW > 0)
 			display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
+	}
+
+	// CAN offline indicator – unter Batterie wenn sichtbar, sonst an deren Stelle
+	if (isnan(vehicleSpeedCached))
+	{
+		display.setFont();
+		display.setTextSize(1);
+		bool battVisible = !isnan(battVoltageCached) && battVoltageCached >= 1.0f &&
+		                   !(battVoltageCached < BATT_LOW_V && ((millis() / 400) % 2) == 0);
+		const int16_t bx = SCREEN_WIDTH - 22;
+		const int16_t by = battVisible ? 12 : 2;
+		display.drawRect(bx, by, 21, 10, SSD1306_WHITE);
+		display.setCursor(bx + 2, by + 1);
+		display.print("CAN");
 	}
 
 	drawRpmRedlineBorder();
@@ -2687,9 +2716,9 @@ void drawSettingsPage()
 	// Centre: title
 	display.setCursor(38, 2);
 	display.print("SETTINGS");
-	// Right: free heap as percentage
-	uint8_t heapPct = (uint8_t)(ESP.getFreeHeap() * 100 / ESP.getHeapSize());
-	snprintf(hdrBuf, sizeof(hdrBuf), "%u%%", heapPct);
+	// Right: RAM used%
+	uint8_t ramUsedPct = (uint8_t)((ESP.getHeapSize() - ESP.getFreeHeap()) * 100 / ESP.getHeapSize());
+	snprintf(hdrBuf, sizeof(hdrBuf), "%u%%", ramUsedPct);
 	int16_t rx = 128 - (int16_t)(strlen(hdrBuf) * 6) - 2;
 	display.setCursor(rx, 2);
 	display.print(hdrBuf);
@@ -2707,7 +2736,7 @@ void drawSettingsPage()
 		"Lean Flip",
 		"Lean Offset",
 		"Pitch Offset",
-		"Reset Lean",
+		"Reset All",
 		"Temp Offset",
 		"Batt Warnung",
 		"G Deadzone"
@@ -2750,7 +2779,7 @@ void drawSettingsPage()
 			case SET_LEAN_OFFSET:
 				snprintf(valBuf, sizeof(valBuf), "%+.0f Grad", rollOffsetDeg);
 				break;
-			case SET_RESET_LEAN:
+			case SET_RESET_ALL:
 				snprintf(valBuf, sizeof(valBuf), "HOLD");
 				break;
 			case SET_DS18_OFFSET:
@@ -3120,6 +3149,18 @@ void setup()
 
 void loop()
 {
+	// CPU-Auslastung messen: Dauer dieser Iteration vs. Interval seit letztem Aufruf
+	static uint64_t prevStartUs  = 0;
+	static uint64_t prevDurUs    = 0;
+	uint64_t loopStartUs = (uint64_t)esp_timer_get_time();
+	if (prevStartUs > 0)
+	{
+		uint64_t interval = loopStartUs - prevStartUs;
+		if (interval > 0)
+			cpuLoadPct = (uint8_t)min((uint64_t)99, prevDurUs * 100 / interval);
+	}
+	prevStartUs = loopStartUs;
+
 	buttonUpdate();
 
 	updateLean();
@@ -3257,6 +3298,15 @@ void loop()
 			rollUi        = simLean;
 			rollFiltered  = simLean;
 		}
+		#elif defined(TEST_MODE_MAIN)
+		{
+			oilTempCached     = 82.0f;
+			battVoltageCached = 12.5f;
+			outsideTemp       = 21.0f;
+			float simLean     = leanTestWave();
+			rollUi            = simLean;
+			rollFiltered      = simLean;
+		}
 		#endif
 
 		// Sleep countdown: turn display off after SLEEP_COUNTDOWN_MS
@@ -3338,9 +3388,9 @@ void loop()
 			display.setTextColor(SSD1306_WHITE);
 			display.display();
 		}
-		else if (page == PAGE_OIL)
+		else if (page == PAGE_MAIN)
 		{
-			drawOilPage(oilTempCached);
+			drawMainPage();
 		}
 		else if (page == PAGE_LEAN)
 		{
@@ -3359,6 +3409,9 @@ void loop()
 			drawRaceBoxPage();
 		}
 	}
+
+	// Dauer VOR dem Delay messen – delay() ist Idle, keine CPU-Last
+	prevDurUs = (uint64_t)esp_timer_get_time() - loopStartUs;
 
 	delay(1);
 	yield();
