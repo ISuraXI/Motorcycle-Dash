@@ -88,6 +88,7 @@
 #include <Fonts/FreeSans9pt7b.h>
 
 #include "driver/twai.h"
+#include <BleKeyboard.h>
 
 // ---------------- CAN bus (TWAI) ----------------
 #define CAN_TX_PIN GPIO_NUM_18
@@ -306,8 +307,17 @@ enum Page : uint8_t
 	PAGE_LEAN = 1,
 	PAGE_G = 2,
 	PAGE_ENGINE = 3,
-	PAGE_RACEBOX = 4
+	PAGE_RACEBOX = 4,
+	PAGE_VOLUME = 5       // BLE media volume control
 };
+
+// ---------------- BLE Keyboard (Volume control) ----------------
+BleKeyboard bleKeyboard("Moto-Dash", "ESP32", 100);
+unsigned long volLastInteractMs = 0;
+#define VOL_PAGE_TIMEOUT_MS 5000
+unsigned long volFeedbackUntilMs = 0;  // show +/- on screen until this time
+bool volFeedbackUp = true;             // true=vol+, false=vol-
+bool volFeedbackWasConn = false;       // was BLE connected when key was sent
 
 // ---------------- RaceBox status inputs ----------------
 #define RACEBOX_GPS_PIN 15  // HIGH when GPS fix active  (GPIO26-32 = flash on ESP32-S3, avoid)
@@ -571,6 +581,7 @@ void drawLeanPage();
 void drawGPage();
 void drawEnginePage();
 void drawRaceBoxPage();
+void drawVolumePage();
 
 void calibrateRollOffset();
 void showReadyScreen();
@@ -875,18 +886,42 @@ void buttonUpdate()
 			{
 				if (btn.pressed && !btn.longFired)
 				{
-					// Cycle within current navigation group
-					if (primaryGroup)
+					if (page == PAGE_VOLUME)
 					{
-						page = (page == PAGE_MAIN) ? PAGE_LEAN : PAGE_MAIN;
+						// Short press on VOLUME = leiser, Timer reset (bleibt auf Seite)
+						if (bleKeyboard.isConnected())
+							bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
+						volLastInteractMs = now;
 					}
 					else
 					{
-						if (page == PAGE_G)            page = PAGE_ENGINE;
-						else if (page == PAGE_ENGINE)  page = PAGE_RACEBOX;
-						else                           page = PAGE_G;
+						// Doppeldruck-Erkennung: 2x kurz innerhalb 250ms → VOLUME Modus (nur Primary)
+						static unsigned long lastSecPressMs = 0;
+						bool doubleTap = primaryGroup && (now - lastSecPressMs) < 250;
+						lastSecPressMs = now;
+
+						if (doubleTap)
+						{
+							// Doppeldruck → VOLUME Modus öffnen
+							page              = PAGE_VOLUME;
+							volLastInteractMs = now;
+						}
+						else
+						{
+							// Normaler Seiten-Zyklus
+							if (primaryGroup)
+							{
+								page = (page == PAGE_MAIN) ? PAGE_LEAN : PAGE_MAIN;
+							}
+							else
+							{
+								if (page == PAGE_G)          page = PAGE_ENGINE;
+								else if (page == PAGE_ENGINE) page = PAGE_RACEBOX;
+								else                          page = PAGE_G;
+							}
+							resetAnimUntilMs = 0;
+						}
 					}
-					resetAnimUntilMs = 0;
 				}
 
 				raceboxBtnArmed = true; // re-arm after button fully released
@@ -1016,7 +1051,7 @@ void buttonUpdate()
 						sprint100State    = S100_IDLE;
 						lastSecondaryPage = page;
 						primaryGroup      = true;
-						page              = lastPrimaryPage;
+						page              = PAGE_MAIN;
 						resetAnimUntilMs  = 0;
 					}
 				}
@@ -1025,7 +1060,7 @@ void buttonUpdate()
 					// G: long press → back to primary group
 					lastSecondaryPage = PAGE_G;
 					primaryGroup      = true;
-					page              = lastPrimaryPage;
+					page              = PAGE_MAIN;
 					resetAnimUntilMs  = 0;
 				}
 				else if (page == PAGE_RACEBOX)
@@ -1037,6 +1072,12 @@ void buttonUpdate()
 						digitalWrite(RACEBOX_BTN_PIN, HIGH);
 						raceboxBtnUntilMs = now + 250;
 					}
+				}
+				else if (page == PAGE_VOLUME)
+				{
+					if (bleKeyboard.isConnected())
+						bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
+					volLastInteractMs = now;
 				}
 			}
 		}
@@ -2114,16 +2155,19 @@ void drawMainPage()
 {
 	static bool mainLeanActive   = false;
 	static unsigned long mainLeanBelowMs = 0;
+	static float mainLeanPeak    = 0.0f;  // highest lean reached since threshold crossed
 
 	const float MAIN_LEAN_THRESHOLD = 25.0f;
 	const unsigned long MAIN_LEAN_HOLD_MS = 4000;
 
-	float leanAbs = fabsf(rollUi);
+	float leanAbs = fabsf(rollFiltered); // use unsmoothed value so peak is never missed
 
 	if (leanAbs >= MAIN_LEAN_THRESHOLD)
 	{
 		mainLeanActive  = true;
-		mainLeanBelowMs = 0;
+		mainLeanBelowMs = 0; // reset hold timer while still above threshold
+		if (leanAbs > mainLeanPeak)
+			mainLeanPeak = leanAbs;
 	}
 	else if (mainLeanActive)
 	{
@@ -2133,7 +2177,12 @@ void drawMainPage()
 		{
 			mainLeanActive  = false;
 			mainLeanBelowMs = 0;
+			mainLeanPeak    = 0.0f;
 		}
+	}
+	else
+	{
+		mainLeanPeak = 0.0f;
 	}
 
 	float oilC = oilTempCached;
@@ -2169,9 +2218,9 @@ void drawMainPage()
 	int16_t baselineY = 41;
 	if (mainLeanActive)
 	{
-		// Show lean angle without degree symbol
+		// Always show peak (never live) – only goes up, held 4s after returning below 30°
 		display.setFont(&FreeSansBold18pt7b);
-		String leanStr = String((int)round(leanAbs));
+		String leanStr = String((int)round(mainLeanPeak));
 		int16_t lx1, ly1; uint16_t lw, lh;
 		display.getTextBounds(leanStr, 0, baselineY, &lx1, &ly1, &lw, &lh);
 		display.setCursor((display.width() - (int16_t)lw) / 2, baselineY);
@@ -2693,6 +2742,68 @@ void drawRaceBoxPage()
 }
 
 // =========================================================
+// Volume control page (BLE HID media keys)
+// =========================================================
+void drawVolumePage()
+{
+	display.clearDisplay();
+	display.setTextColor(SSD1306_WHITE);
+	display.setFont();
+	display.setTextSize(1);
+
+	// Title centred
+	{
+		const char* title = "VOLUME";
+		int16_t x1, y1; uint16_t tw, th;
+		display.getTextBounds(title, 0, 0, &x1, &y1, &tw, &th);
+		display.setCursor((128 - (int16_t)tw) / 2, 1);
+		display.print(title);
+	}
+	display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+
+	// BT icon + connection status
+	display.drawBitmap(0, 11, icon_bt, 12, 12, SSD1306_WHITE);
+	display.setCursor(15, 12);
+	bool btConn = bleKeyboard.isConnected();
+	if (btConn)
+	{
+		display.print("Verbunden");
+	}
+	else
+	{
+		if (((millis() / 500) % 2) == 0)
+			display.print("Suche...");
+	}
+
+	// Vol+ row: + symbol = lauter (halten)
+	display.setTextSize(2);
+	display.setCursor(2, 27);
+	display.print("+");
+	display.setTextSize(1);
+	display.setCursor(20, 29);
+	display.print("Lauter  (halten)");
+
+	// Vol- row: - symbol = leiser (kurz + exit)
+	display.setTextSize(2);
+	display.setCursor(4, 41);
+	display.print("-");
+	display.setTextSize(1);
+	display.setCursor(20, 43);
+	display.print("Leiser  (kurz)");
+
+	// Auto-close countdown bar at bottom
+	unsigned long elapsed = millis() - volLastInteractMs;
+	float frac = 1.0f - clampf((float)elapsed / (float)VOL_PAGE_TIMEOUT_MS, 0.0f, 1.0f);
+	int barW = (int)(118.0f * frac);
+	display.drawRect(5, 57, 118, 5, SSD1306_WHITE);
+	if (barW > 0)
+		display.fillRect(5, 57, barW, 5, SSD1306_WHITE);
+
+	drawRpmRedlineBorder();
+	display.display();
+}
+
+// =========================================================
 // Fonts showcase page
 // =========================================================
 // =========================================================
@@ -3145,6 +3256,9 @@ void setup()
 	// outside temp was already read during boot wait — no extra request needed
 
 	showReadyScreen();
+
+	// BLE HID keyboard for media volume control (NimBLE backend = stable address)
+	bleKeyboard.begin();
 }
 
 void loop()
@@ -3162,6 +3276,15 @@ void loop()
 	prevStartUs = loopStartUs;
 
 	buttonUpdate();
+
+	// PAGE_VOLUME: auto-exit to PAGE_MAIN after 5s of no interaction
+	if (page == PAGE_VOLUME && volLastInteractMs > 0 &&
+	    (millis() - volLastInteractMs) >= VOL_PAGE_TIMEOUT_MS)
+	{
+		primaryGroup      = true;
+		page              = PAGE_MAIN;
+		volLastInteractMs = 0;
+	}
 
 	updateLean();
 	updateGForce();
@@ -3404,9 +3527,13 @@ void loop()
 		{
 			drawEnginePage();
 		}
-		else
+		else if (page == PAGE_RACEBOX)
 		{
 			drawRaceBoxPage();
+		}
+		else
+		{
+			drawVolumePage();
 		}
 	}
 
