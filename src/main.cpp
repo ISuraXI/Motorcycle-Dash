@@ -52,14 +52,26 @@
   OIL_PIN (legacy NTC direct-ADC fallback, not actively used)
     GPIO 1   ← oil temp is read via ADS1115 channel 0
 
+  BLE HID Media Keyboard (NimBLE backend)
+    Device name : "Moto-Dash"
+    Backend     : NimBLE (-DUSE_NIMBLE) → stable MAC address, no iOS duplicate-pairing
+    Sends       : KEY_MEDIA_VOLUME_UP / KEY_MEDIA_VOLUME_DOWN
+    Note        : iOS blocks BLE HID when screen is locked (OS restriction)
+
   Pages:
-  Primary group  (short press cycles OIL ↔ LEAN):
-   - Short press : cycle OIL → LEAN → OIL
-   - Long press  : LEAN 800ms → enter secondary group
-                   OIL  5s   → settings / calibrate
+  Primary group  (short press cycles MAIN ↔ LEAN):
+   - Short press        : cycle MAIN → LEAN → MAIN
+   - Double-tap (<250ms): open VOLUME page
+   - Long press MAIN 5s : enter settings
+   - Long press LEAN 800ms: enter secondary group
   Secondary group (short press cycles G → ENGINE → RACEBOX):
    - Short press : cycle G → ENGINE → RACEBOX → G
-   - Long press 800ms on any secondary page → back to primary group
+   - Long press 800ms on any secondary page → back to PRIMARY (always MAIN)
+  VOLUME page:
+   - Short press : Vol- (leiser), bleibt auf Seite, Timer reset
+   - Long press  : Vol+ (lauter)
+   - Auto-exit   : nach 5 s Inaktivität → zurück zu MAIN
+   - Beim BLE-Connect (wenn AN): 16× Vol- dann N× Vol+ (non-blocking state machine)
 
   Boot:
    - Screen shows immediately, sensors flip from "..." to OK/FAIL as they init

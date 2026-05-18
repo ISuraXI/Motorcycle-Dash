@@ -70,18 +70,20 @@ A custom motorcycle dashboard built on the **ESP32-S3 N16R8** (16 MB Flash, 8 MB
 
 Two navigation groups, switched by long press (800 ms):
 
-**Primary group** — short press cycles OIL ↔ LEAN  
+**Primary group** — short press cycles MAIN ↔ LEAN  
 **Secondary group** — short press cycles G → ENGINE → RACEBOX → G  
 Long press on LEAN → enter secondary group  
-Long press on any secondary page → back to primary group
+Long press on any secondary page → back to MAIN (primary group)  
+**Double-tap** (2× kurz < 250 ms) in Primary group → VOLUME page
 
-| Page | Content | Long-press action |
-|---|---|---|
-| OIL | Oil temp (°C), coolant temp (OBD2), outside temp, battery voltage | Open settings (hold 5 s) |
-| LEAN | Current lean angle, corner peak hold, all-time max L/R; CAN-offline badge top-right when OBD2 speed unavailable | Enter secondary group (800 ms); **2,5 s halten → L/R-Max zurücksetzen** |
-| G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Enter primary group (800 ms) |
-| ENGINE | RPM, coolant, load, throttle, speed, 0–100 km/h timer | Arm 0–100 timer when idle (800 ms); cancel timer + back to primary when timer active |
-| RACEBOX | GPS fix / BLE / recording status, auto-start recording | Enter primary group (800 ms) |
+| Page | Content | Short-press | Long-press action |
+|---|---|---|---|
+| MAIN | Oil temp, coolant (OBD2), outside temp, battery voltage | Cycle MAIN ↔ LEAN | Open settings (hold 5 s) |
+| LEAN | Current lean angle, corner peak hold, all-time max L/R; CAN-offline badge | Cycle LEAN ↔ MAIN | Enter secondary group (800 ms) |
+| G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Cycle G → ENGINE | Enter primary group (800 ms) |
+| ENGINE | RPM, coolant, load, throttle, speed, 0–100 km/h timer | Cycle ENGINE → RACEBOX | Arm 0–100 timer (idle) / cancel + back to primary (active) |
+| RACEBOX | GPS fix / BLE / recording status, auto-start recording | Cycle RACEBOX → G | Enter primary group (800 ms) |
+| VOLUME | BLE-Lautstärke-Steuerung, Pegelbalken 0–16 | Vol- (leiser) | Vol+ (lauter) |
 
 ### Settings (OIL page hold 5 s)
 
@@ -121,7 +123,16 @@ claws/BH1750
 adafruit/Adafruit ADS1X15
 milesburton/DallasTemperature
 paulstoffregen/OneWire
+h2zero/NimBLE-Arduino          ← stabile MAC-Adresse, kein iOS Duplicate-Pairing
+https://github.com/T-vK/ESP32-BLE-Keyboard.git  ← BLE HID Keyboard (NimBLE backend)
 ```
+
+### BLE Lautstärke-Steuerung
+
+- Der ESP32-S3 meldet sich als BLE HID Keyboard (`"Moto-Dash"`) bei iOS an.
+- **Double-tap** (2× kurz < 250 ms) in der Primary Group öffnet die VOLUME-Seite.
+- Kurz drücken = Vol-, halten = Vol+. Auto-Exit nach 5 s.
+- **Einschränkung iOS**: BLE HID funktioniert nur bei entsperrtem Gerät (OS-Sicherheitsbeschränkung). AVRCP (Sena-Headset) ist davon nicht betroffen.
 
 ### Boot sequence
 1. OLED turns on immediately.
