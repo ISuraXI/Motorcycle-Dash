@@ -83,9 +83,9 @@ Long press on any secondary page → back to MAIN (primary group)
 | G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Cycle G → ENGINE | Enter primary group (800 ms) |
 | ENGINE | RPM, coolant, load, throttle, speed, 0–100 km/h timer | Cycle ENGINE → RACEBOX | Arm 0–100 timer (idle) / cancel + back to primary (active) |
 | RACEBOX | GPS fix / BLE / recording status, auto-start recording | Cycle RACEBOX → G | Enter primary group (800 ms) |
-| VOLUME | BLE-Lautstärke-Steuerung, Pegelbalken 0–16 | Vol- (leiser) | Vol+ (lauter) |
+| VOLUME | BLE-Lautstärke-Steuerung; Auto-exit nach 5 s | Vol- (leiser) | Vol+ (lauter) |
 
-### Settings (OIL page hold 5 s)
+### Settings (MAIN page hold 5 s)
 
 Short press navigates items (scrolling list). Long press (600 ms) changes value.
 
