@@ -70,19 +70,18 @@ A custom motorcycle dashboard built on the **ESP32-S3 N16R8** (16 MB Flash, 8 MB
 
 Two navigation groups, switched by long press (800 ms):
 
-**Primary group** — short press cycles MAIN ↔ LEAN  
+**Primary group** — short press cycles MAIN ↔ LEAN; Double-tap (< 250 ms) → VOLUME  
 **Secondary group** — short press cycles G → ENGINE → RACEBOX → G  
 Long press on LEAN → enter secondary group  
 Long press on any secondary page → back to MAIN (primary group)  
-**Double-tap** (2× kurz < 250 ms) in Primary group → VOLUME page
 
 | Page | Content | Short-press | Long-press action |
 |---|---|---|---|
-| MAIN | Oil temp, coolant (OBD2), outside temp, battery voltage | Cycle MAIN ↔ LEAN | Open settings (hold 5 s) |
-| LEAN | Current lean angle, corner peak hold, all-time max L/R; CAN-offline badge | Cycle LEAN ↔ MAIN | Enter secondary group (800 ms) |
+| MAIN | Öltemperatur, Kühlwasser (OBD2), Außentemperatur, Batteriespannung | Cycle MAIN ↔ LEAN | Open settings (hold 5 s) |
+| LEAN | Aktiver Schräglagenwinkel, Kurven-Peak, All-time max L/R; CAN-offline Badge | Cycle LEAN ↔ MAIN | Enter secondary group (800 ms) |
 | G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Cycle G → ENGINE | Enter primary group (800 ms) |
-| ENGINE | RPM, coolant, load, throttle, speed, 0–100 km/h timer | Cycle ENGINE → RACEBOX | Arm 0–100 timer (idle) / cancel + back to primary (active) |
-| RACEBOX | GPS fix / BLE / recording status, auto-start recording | Cycle RACEBOX → G | Enter primary group (800 ms) |
+| ENGINE | RPM, Kühlwasser, Last, Drosselklappe, Speed, 0–100 km/h Timer | Cycle ENGINE → RACEBOX | Arm 0–100 timer (idle) / cancel + back to primary (active) |
+| RACEBOX | GPS-Fix / BLE / Recording-Status, Auto-Start Recording | Cycle RACEBOX → G | Enter primary group (800 ms) |
 | VOLUME | BLE-Lautstärke-Steuerung; Auto-exit nach 5 s | Vol- (leiser) | Vol+ (lauter) |
 
 ### Settings (MAIN page hold 5 s)
