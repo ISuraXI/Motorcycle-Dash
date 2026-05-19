@@ -68,23 +68,28 @@ A custom motorcycle dashboard built on the **ESP32-S3 N16R8** (16 MB Flash, 8 MB
 
 ## Display Pages & Navigation
 
-Two navigation groups, switched by long press (800 ms):
+Zwei Navigationsgruppen:
 
-**Primary group** — short press cycles MAIN ↔ LEAN; Double-tap (< 250 ms) → VOLUME  
-**Secondary group** — short press cycles G → ENGINE → RACEBOX → G  
-Long press on LEAN → enter secondary group  
-Long press on any secondary page → back to MAIN (primary group)  
+**Primary group** — nur MAIN  
+**Secondary group** — Short press cycles LEAN → G → ENGINE → RACEBOX → LEAN  
+
+| Aktion | Beschreibung |
+|---|---|
+| Double-tap (< 250 ms) in Primary | Wechsel in Secondary group (startet bei LEAN) |
+| Double-tap (< 250 ms) in Secondary | Zurück zur Primary group (MAIN) |
+| Halten 2 s auf MAIN | VOLUME-Seite öffnen |
+| Halten 2 s auf LEAN | Settings öffnen (Auto-Exit nach 5 s → LEAN) |
 
 | Page | Content | Short-press | Long-press action |
 |---|---|---|---|
-| MAIN | Öltemperatur, Kühlwasser (OBD2), Außentemperatur, Batteriespannung | Cycle MAIN ↔ LEAN | Open settings (hold 5 s) |
-| LEAN | Aktiver Schräglagenwinkel, Kurven-Peak, All-time max L/R; CAN-offline Badge | Cycle LEAN ↔ MAIN | Enter secondary group (800 ms) |
-| G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Cycle G → ENGINE | Enter primary group (800 ms) |
-| ENGINE | RPM, Kühlwasser, Last, Drosselklappe, Speed, 0–100 km/h Timer | Cycle ENGINE → RACEBOX | Arm 0–100 timer (idle) / cancel + back to primary (active) |
-| RACEBOX | GPS-Fix / BLE / Recording-Status, Auto-Start Recording | Cycle RACEBOX → G | Enter primary group (800 ms) |
+| MAIN | Öltemperatur, Kühlwasser (OBD2), Außentemperatur, Batteriespannung | — (nur MAIN in Primary) | VOLUME öffnen (2 s) |
+| LEAN | Aktiver Schräglagenwinkel, Kurven-Peak, All-time max L/R; CAN-offline Badge | Cycle LEAN → G | Settings öffnen (2 s) |
+| G | Längs-G-Kraft (Bremsen/Gas), Bremsen-Peak & Gas-Peak | Cycle G → ENGINE | — |
+| ENGINE | RPM, Kühlwasser, Last, Drosselklappe, Speed, 0–100 km/h Timer | Cycle ENGINE → RACEBOX | 0–100 Timer armen / abbrechen (800 ms) |
+| RACEBOX | GPS-Fix / BLE / Recording-Status, Auto-Start Recording | Cycle RACEBOX → LEAN | RaceBox-Taste simulieren (800 ms) |
 | VOLUME | BLE-Lautstärke-Steuerung; Auto-exit nach 5 s | Vol- (leiser) | Vol+ (lauter) |
 
-### Settings (MAIN page hold 5 s)
+### Settings (LEAN page hold 3 s)
 
 Short press navigates items (scrolling list). Long press (600 ms) changes value.
 
@@ -129,7 +134,8 @@ https://github.com/T-vK/ESP32-BLE-Keyboard.git  ← BLE HID Keyboard (NimBLE bac
 ### BLE Lautstärke-Steuerung
 
 - Der ESP32-S3 meldet sich als BLE HID Keyboard (`"Moto-Dash"`) bei iOS an.
-- **Double-tap** (2× kurz < 250 ms) in der Primary Group öffnet die VOLUME-Seite.
+- **Double-tap** (2× kurz < 250 ms) in der Primary Group wechselt in die Secondary Group (LEAN).
+- **2 s halten** auf MAIN öffnet die VOLUME-Seite.
 - Kurz drücken = Vol-, halten = Vol+. Auto-Exit nach 5 s.
 - **Einschränkung iOS**: BLE HID funktioniert nur bei entsperrtem Gerät (OS-Sicherheitsbeschränkung). AVRCP (Sena-Headset) ist davon nicht betroffen.
 

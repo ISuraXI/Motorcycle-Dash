@@ -59,14 +59,15 @@
     Note        : iOS blocks BLE HID when screen is locked (OS restriction)
 
   Pages:
-  Primary group  (short press cycles MAIN ↔ LEAN):
-   - Short press        : cycle MAIN → LEAN → MAIN
-   - Double-tap (<250ms): open VOLUME page
-   - Long press MAIN 5s : enter settings
-   - Long press LEAN 800ms: enter secondary group
-  Secondary group (short press cycles G → ENGINE → RACEBOX):
-   - Short press : cycle G → ENGINE → RACEBOX → G
-   - Long press 800ms on any secondary page → back to PRIMARY (always MAIN)
+  Primary group (only MAIN):
+   - Double-tap (<250ms)  : enter secondary group (starts at LEAN)
+   - Long press MAIN 2s   : enter VOLUME page
+  Secondary group (short press cycles LEAN → G → ENGINE → RACEBOX):
+   - Short press          : cycle LEAN → G → ENGINE → RACEBOX → LEAN
+   - Double-tap (<250ms)  : back to primary group (MAIN)
+   - Long press LEAN 2s   : enter settings (auto-exit after 5s → back to LEAN)
+   - Long press ENGINE 800ms: arm/cancel 0–100 km/h sprint timer
+   - Long press RACEBOX 800ms: simulate RaceBox button press
   VOLUME page:
    - Short press : Vol- (leiser), bleibt auf Seite, Timer reset
    - Long press  : Vol+ (lauter)
@@ -394,7 +395,7 @@ Page page = PAGE_MAIN;
 // Two-group navigation: primary (OIL/LEAN) and secondary (G/ENGINE/RACEBOX)
 bool primaryGroup       = true;       // true = in primary group
 Page lastPrimaryPage    = PAGE_MAIN; // remembered when leaving primary
-Page lastSecondaryPage  = PAGE_G;     // remembered when leaving secondary
+Page lastSecondaryPage  = PAGE_LEAN;  // remembered when leaving secondary
 
 #define BTN_PIN  4
 #define DEBOUNCE_MS 15
@@ -414,8 +415,9 @@ struct ButtonState
 unsigned long resetAnimUntilMs = 0;
 
 // ---------------- Settings ----------------
-#define SETTINGS_OPEN_MS      5000   // hold duration to enter settings
-#define SETTINGS_TIMEOUT_MS   10000  // auto-close after 10s inactivity
+#define MAIN_VOL_LONGPRESS_MS  2000   // hold MAIN this long → enter VOLUME page
+#define LEAN_SETTINGS_OPEN_MS 2000   // hold LEAN this long → enter settings
+#define SETTINGS_TIMEOUT_MS   5000   // auto-close settings after 5s inactivity → back to LEAN
 #define SETTINGS_LONGPRESS_MS 600    // long press inside settings = change value
 #define SLEEP_COUNTDOWN_MS    3000   // delay before display goes dark after activating sleep
 
@@ -907,29 +909,45 @@ void buttonUpdate()
 					}
 					else
 					{
-						// Doppeldruck-Erkennung: 2x kurz innerhalb 250ms → VOLUME Modus (nur Primary)
+						// Double-tap detection (250ms window) - works in both groups
 						static unsigned long lastSecPressMs = 0;
-						bool doubleTap = primaryGroup && (now - lastSecPressMs) < 250;
+						bool doubleTap = (now - lastSecPressMs) < 250;
 						lastSecPressMs = now;
 
 						if (doubleTap)
 						{
-							// Doppeldruck → VOLUME Modus öffnen
-							page              = PAGE_VOLUME;
-							volLastInteractMs = now;
-						}
-						else
-						{
-							// Normaler Seiten-Zyklus
 							if (primaryGroup)
 							{
-								page = (page == PAGE_MAIN) ? PAGE_LEAN : PAGE_MAIN;
+								// Double-tap in primary → enter secondary group at LEAN
+								lastPrimaryPage   = PAGE_MAIN;
+								primaryGroup      = false;
+								page              = PAGE_LEAN;
+								lastSecondaryPage = PAGE_LEAN;
+								resetAnimUntilMs  = 0;
 							}
 							else
 							{
-								if (page == PAGE_G)          page = PAGE_ENGINE;
-								else if (page == PAGE_ENGINE) page = PAGE_RACEBOX;
-								else                          page = PAGE_G;
+								// Double-tap in secondary → back to primary (MAIN)
+								lastSecondaryPage = page;
+								primaryGroup      = true;
+								page              = PAGE_MAIN;
+								resetAnimUntilMs  = 0;
+							}
+						}
+						else
+						{
+							// Single press: cycle within current group
+							if (primaryGroup)
+							{
+								// Only MAIN in primary group - nothing to cycle
+							}
+							else
+							{
+								// Cycle: LEAN → G → ENGINE → RACEBOX → LEAN
+								if (page == PAGE_LEAN)         page = PAGE_G;
+								else if (page == PAGE_G)       page = PAGE_ENGINE;
+								else if (page == PAGE_ENGINE)  page = PAGE_RACEBOX;
+								else                           page = PAGE_LEAN;
 							}
 							resetAnimUntilMs = 0;
 						}
@@ -942,7 +960,7 @@ void buttonUpdate()
 		}
 	}
 
-	// ---- settings: 10s inactivity timeout ----
+	// ---- settings: 5s inactivity timeout → back to LEAN ----
 	if (settingsOpen && (now - settingsLastActMs) >= SETTINGS_TIMEOUT_MS)
 	{
 		settingsOpen = false;
@@ -1023,16 +1041,28 @@ void buttonUpdate()
 		else
 		{
 			// ---- normal long press ----
-			// MAIN: 800ms → settings
+			// MAIN: 5s → VOLUME page
 			if (page == PAGE_MAIN)
 			{
-				if (!btn.longFired && (now - btn.pressStartMs) >= LONGPRESS_MS)
+				if (!btn.longFired && (now - btn.pressStartMs) >= MAIN_VOL_LONGPRESS_MS)
 				{
-					btn.longFired = true;
-					settingsOpen  = true;
-					settingsIdx   = 0;
-					settingsLastActMs = now;
-					settingsLongFired = false;
+					btn.longFired     = true;
+					page              = PAGE_VOLUME;
+					volLastInteractMs = now;
+				}
+				return;
+			}
+
+			// LEAN (secondary): 3s → settings
+			if (page == PAGE_LEAN)
+			{
+				if (!btn.longFired && (now - btn.pressStartMs) >= LEAN_SETTINGS_OPEN_MS)
+				{
+					btn.longFired               = true;
+					settingsOpen                = true;
+					settingsIdx                 = 0;
+					settingsLastActMs           = now;
+					settingsLongFired           = false;
 					settingsEnterReleasePending = true;
 				}
 				return;
@@ -1042,15 +1072,7 @@ void buttonUpdate()
 			{
 				btn.longFired = true;
 
-				if (page == PAGE_LEAN)
-				{
-					// LEAN: long press → enter secondary group
-					lastPrimaryPage  = PAGE_LEAN;
-					primaryGroup     = false;
-					page             = lastSecondaryPage;
-					resetAnimUntilMs = 0;
-				}
-				else if (page == PAGE_ENGINE)
+				if (page == PAGE_ENGINE)
 				{
 					if (sprint100State == S100_IDLE)
 					{
@@ -1059,21 +1081,10 @@ void buttonUpdate()
 					}
 					else
 					{
-						// Cancel and go back to primary
-						sprint100State    = S100_IDLE;
-						lastSecondaryPage = page;
-						primaryGroup      = true;
-						page              = PAGE_MAIN;
-						resetAnimUntilMs  = 0;
+						// Cancel sprint timer
+						sprint100State   = S100_IDLE;
+						resetAnimUntilMs = 0;
 					}
-				}
-				else if (page == PAGE_G)
-				{
-					// G: long press → back to primary group
-					lastSecondaryPage = PAGE_G;
-					primaryGroup      = true;
-					page              = PAGE_MAIN;
-					resetAnimUntilMs  = 0;
 				}
 				else if (page == PAGE_RACEBOX)
 				{
@@ -2280,11 +2291,11 @@ void drawMainPage()
 		display.drawRect(1, 1, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2, SSD1306_WHITE);
 	}
 
-	// hold-progress bar: 800ms entry (same as standard long-press)
+	// hold-progress bar: fills over 2s towards VOLUME page
 	if (btn.pressed && !mainLeanActive)
 	{
 		unsigned long held = millis() - btn.pressStartMs;
-		int barW = (int)((float)held / (float)LONGPRESS_MS * 126.0f);
+		int barW = (int)((float)held / (float)MAIN_VOL_LONGPRESS_MS * 126.0f);
 		if (barW > 126) barW = 126;
 		if (barW > 0)
 			display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
@@ -2381,6 +2392,16 @@ void drawLeanPage()
 
 	drawBlitzerWarnerAliveIndicator();
 	drawRpmRedlineBorder();
+
+	// hold-progress bar: fills over 2s towards settings
+	if (btn.pressed)
+	{
+		unsigned long held = millis() - btn.pressStartMs;
+		int barW = (int)((float)held / (float)LEAN_SETTINGS_OPEN_MS * 126.0f);
+		if (barW > 126) barW = 126;
+		if (barW > 0)
+			display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
+	}
 
 	// CAN offline indicator: small "CAN" badge top-right when OBD2 speed is unavailable.
 	// Physics drift-correction (Mode 3) relies on speed → warns rider it's inactive.
