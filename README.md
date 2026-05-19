@@ -89,7 +89,7 @@ Zwei Navigationsgruppen:
 | RACEBOX | GPS-Fix / BLE / Recording-Status, Auto-Start Recording | Cycle RACEBOX → LEAN | RaceBox-Taste simulieren (800 ms) |
 | VOLUME | BLE-Lautstärke-Steuerung; Auto-exit nach 5 s | Vol- (leiser) | Vol+ (lauter) |
 
-### Settings (LEAN page hold 3 s)
+### Settings (LEAN page hold 2 s)
 
 Short press navigates items (scrolling list). Long press (600 ms) changes value.
 
