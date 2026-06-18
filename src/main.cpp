@@ -8,12 +8,13 @@
     SDA  = GPIO 8
     SCL  = GPIO 9
 
-  OLED 1.54" (SSD1309 / SSD1306-kompatibel) 128×64 – SPI2
+  TFT 1.69" ST7789 (240×280, SPI2, landscape via rotation 1 → 280×240)
     DIN/MOSI = GPIO 11  (SPI2_MOSI)
     CLK/SCK  = GPIO 12  (SPI2_SCK)
     CS       = GPIO 10
     DC       = GPIO 5
     RST      = GPIO 6
+    BLK      = 3.3 V (backlight always on)
 
   BNO085 (I2C, address 0x4A)
     → uses shared I2C bus above; no dedicated reset pin
@@ -85,7 +86,10 @@
 #include <EEPROM.h>
 
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_ST7789.h>
+// ST7789: map old SSD1306 color constants to 16-bit RGB565
+#define SSD1306_WHITE  ST77XX_WHITE
+#define SSD1306_BLACK  ST77XX_BLACK
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO08x.h>
 
@@ -95,7 +99,6 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#include <U8g2_for_Adafruit_GFX.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
@@ -111,9 +114,9 @@
 #define SDA_PIN 8
 #define SCL_PIN 9
 
-// ---------------- OLED (SPI2) ----------------
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+// ---------------- TFT (SPI2) ----------------
+#define SCREEN_WIDTH  280   // ST7789 1.69" landscape (setRotation 1)
+#define SCREEN_HEIGHT 240
 
 // ESP32-S3 SPI2 hardware pins
 // Module labels: VCC GND DIN CLK CS DC RST
@@ -123,10 +126,28 @@
 #define OLED_RST   6 // RST  -> GPIO 6
 #define OLED_CS   10 // CS   -> GPIO 10
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RST, OLED_CS);
+// ---- Physical TFT hardware driver (SPI device) ----
+static Adafruit_ST7789 _tft_hw(&SPI, OLED_CS, OLED_DC, OLED_RST);
 
-// ---- U8g2-for-Adafruit-GFX: sharp fonts + icon renderer ----
-U8G2_FOR_ADAFRUIT_GFX u8g2fonts;
+// ---- GFXcanvas16-backed display: ALL drawing goes into a RAM framebuffer.
+// display() pushes the complete buffer to the TFT in one SPI burst → zero flicker.
+class TFT_Display : public GFXcanvas16 {
+public:
+    TFT_Display() : GFXcanvas16(SCREEN_WIDTH, SCREEN_HEIGHT) {}
+    void clearDisplay()            { fillScreen(0x0000); }
+    void display() {
+        _tft_hw.startWrite();
+        _tft_hw.setAddrWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        _tft_hw.writePixels(getBuffer(), (uint32_t)SCREEN_WIDTH * SCREEN_HEIGHT);
+        _tft_hw.endWrite();
+    }
+    void ssd1306_command(uint8_t c) {
+        if      (c == 0xAF) _tft_hw.enableDisplay(true);
+        else if (c == 0xAE) _tft_hw.enableDisplay(false);
+    }
+    void invertDisplay(bool inv)   { _tft_hw.invertDisplay(inv); }
+};
+TFT_Display display;
 
 // 8×8 PROGMEM status icons (MSB = leftmost pixel per row)
 // ---- 12×12 status icons (2 bytes per row, MSB left, bottom 4 bits of 2nd byte unused) ----
@@ -240,7 +261,7 @@ float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text
 // #define TEST_MODE
 // When active: sensors cycle through normal range, warnings NOT triggered
 // Use TEST_MODE_WARNINGS to also test warning screens
-// #define TEST_MODE_WARNINGS
+#define TEST_MODE_WARNINGS
 // Main demo: fixed oil/batt/temp, lean oscillates 0→41→0 (pause 8s) 0→-51→0 (pause 8s)
 // #define TEST_MODE_MAIN
 
@@ -584,7 +605,7 @@ void drawCenteredTitleTiny(const char *text, int16_t baselineY);
 void drawLeanSemiGauge(float rollDeg);
 
 void drawHatchedRect(int x, int y, int w, int h, int spacing = 3);
-void drawOilBar(float oilC, int barX = 10, int barW = 108);
+void drawOilBar(float oilC, int barX = 20, int barW = 240);
 void drawMainPage();
 void drawBlitzerWarnerAliveIndicator();
 void drawRpmRedlineBorder();
@@ -709,8 +730,8 @@ static int mapf_to_i(float v, float inMin, float inMax, int outMin, int outMax)
 }
 static void oledSetContrast(uint8_t c)
 {
-	display.ssd1306_command(0x81); // SSD1306_SETCONTRAST
-	display.ssd1306_command(c);
+	// ST7789 has no direct contrast control – stub for API compatibility
+	(void)c;
 }
 
 // =========================================================
@@ -1896,12 +1917,12 @@ void drawCenteredBigNumberWithDegree(int value, int16_t baselineY)
 	int16_t cx = rightX + r + 4;
 	int16_t cy = topY + r - 4;
 
-	if (cx > 127 - r)
-		cx = 127 - r;
+	if (cx > 279 - r)
+		cx = 279 - r;
 	if (cy < r)
 		cy = r;
-	if (cy > 63 - r)
-		cy = 63 - r;
+	if (cy > 239 - r)
+		cy = 239 - r;
 
 	display.drawCircle(cx, cy, r, SSD1306_WHITE);
 }
@@ -1937,9 +1958,9 @@ void drawCenteredTitleTiny(const char *text, int16_t baselineY)
 // =========================================================
 void drawLeanSemiGauge(float rollDeg)
 {
-	const int16_t cx = 64;
-	const int16_t cy = 63;
-	const int16_t r = 28;
+	const int16_t cx = 140;  // screen center x
+	const int16_t cy = 239;  // bottom edge
+	const int16_t r  = 95;   // radius
 
 	const float maxDeg = 60.0f;
 	if (fabs(rollDeg) < LEAN_DEADZONE_DEG)
@@ -1975,7 +1996,7 @@ void drawLeanSemiGauge(float rollDeg)
 	{
 		int16_t tx = cx;
 		int16_t ty = cy - r;
-		display.fillTriangle(tx, ty - 2, tx - 3, ty + 3, tx + 3, ty + 3, SSD1306_WHITE);
+		display.fillTriangle(tx, ty - 4, tx - 6, ty + 5, tx + 6, ty + 5, SSD1306_WHITE);
 	}
 
 	// center line
@@ -2083,67 +2104,86 @@ void drawBlitzerWarnerAliveIndicator()
 	// Warner offline oder noch nie verbunden → blinkende kleine Striche links und rechts
 	if (((millis() / 400) % 2) == 0)
 	{
-		display.fillRect(0,   26, 3, 12, SSD1306_WHITE);
-		display.fillRect(125, 26, 3, 12, SSD1306_WHITE);
+		display.fillRect(0,   97, 6, 45, SSD1306_WHITE);
+		display.fillRect(274, 97, 6, 45, SSD1306_WHITE);
 	}
 }
 
 void drawOilBar(float oilC, int barX, int barW)
 {
 	const int x = barX;
-	const int y = 56;
+	const int y = 214;
 	const int w = barW;
-	const int h = 6;
+	const int h = 18;
 
-	display.drawRect(x, y, w, h, SSD1306_WHITE);
+	// Flat-UI colour palette (RGB565)
+	//  cold  → #3498DB  steel-blue  0x34DB
+	//  good  → #2ECC71  emerald     0x2E6E
+	//  hot   → #E67E22  orange      0xE3E4  →  #E74C3C  flat-red  0xE267
+	//  crit  → #E74C3C  flat-red    0xE267
+	static constexpr uint16_t COL_COLD   = 0x34DB;
+	static constexpr uint16_t COL_GOOD   = 0x2E6E;
+	static constexpr uint16_t COL_ORANGE = 0xE3E4;
+	static constexpr uint16_t COL_RED    = 0xE267;
+
 	bool valid = !isnan(oilC);
+	uint16_t fillColor = COL_COLD;
+	if (valid)
+	{
+		if (oilC >= OIL_CRITICAL_C)
+			fillColor = COL_RED;
+		else if (oilC > OIL_GOOD_MAX)
+		{
+			// smooth lerp orange → red
+			float t = clampf((oilC - OIL_GOOD_MAX) / (OIL_CRITICAL_C - OIL_GOOD_MAX), 0.0f, 1.0f);
+			uint8_t r5 = 28;
+			uint8_t g6 = (uint8_t)(31.0f - t * 12.0f); // 31 → 19
+			uint8_t b5 = (uint8_t)(4.0f  + t * 3.0f);  //  4 →  7
+			fillColor = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+		}
+		else if (oilC >= OIL_GOOD_MIN)
+			fillColor = COL_GOOD;
+		// else keep COL_COLD
+	}
+
+	// border: dim grey so it doesn't fight the colour fill
+	display.drawRect(x, y, w, h, 0x7BEF); // #808080
 
 	int gx1 = x + 1 + mapf_to_i(OIL_GOOD_MIN, OIL_BAR_MIN_C, OIL_BAR_MAX_C, 0, w - 3);
 	int gx2 = x + 1 + mapf_to_i(OIL_GOOD_MAX, OIL_BAR_MIN_C, OIL_BAR_MAX_C, 0, w - 3);
-	if (gx2 < gx1)
-	{
-		int tmp = gx1;
-		gx1 = gx2;
-		gx2 = tmp;
-	}
-	int gw = gx2 - gx1 + 1;
+	if (gx2 < gx1) { int tmp = gx1; gx1 = gx2; gx2 = tmp; }
 
-	int fillRight = x + 1; // right edge of the solid fill
 	if (valid)
 	{
 		float t = clampf(oilC, OIL_BAR_MIN_C, OIL_BAR_MAX_C);
 		int fillW = mapf_to_i(t, OIL_BAR_MIN_C, OIL_BAR_MAX_C, 0, w - 2);
 		if (fillW > 0)
-		{
-			display.fillRect(x + 1, y + 1, fillW, h - 2, SSD1306_WHITE);
-			fillRight = x + 1 + fillW;
-		}
+			display.fillRect(x + 1, y + 1, fillW, h - 2, fillColor);
 	}
 
-	display.drawFastVLine(gx1, y - 2, h + 4, SSD1306_WHITE);
-	display.drawFastVLine(gx2, y - 2, h + 4, SSD1306_WHITE);
+	// zone tick marks – same colour as the zone they mark, slightly brighter
+	display.drawFastVLine(gx1, y - 6, h + 12, COL_GOOD);
+	display.drawFastVLine(gx2, y - 6, h + 12, COL_ORANGE);
 
-	if (valid && oilC >= 115.0f)
+	// critical: flash red double-border
+	if (valid && oilC >= OIL_CRITICAL_C)
 	{
-		bool on = ((millis() / 140) % 2) == 0;
-		if (on)
+		if (((millis() / 140) % 2) == 0)
 		{
-			display.fillRect(x, y, w, h, SSD1306_WHITE);
-			display.fillRect(x + 1, y + 1, w - 2, h - 2, SSD1306_BLACK);
-			display.drawFastVLine(gx1, y - 2, h + 4, SSD1306_WHITE);
-			display.drawFastVLine(gx2, y - 2, h + 4, SSD1306_WHITE);
+			display.drawRect(x,     y,     w,     h,     COL_RED);
+			display.drawRect(x - 1, y - 1, w + 2, h + 2, COL_RED);
 		}
 	}
 }
 
 // fixed margin from screen edge used for both outside temp and battery
-#define SIDE_MARGIN 4 // small gap from edge, adjust as needed
+#define SIDE_MARGIN 8 // small gap from edge
 
 // Snowflake warning: drawn near outside temp when <= 0°C (ice risk)
 static void drawSnowflakeWarning(int16_t cx, int16_t cy)
 {
 	// 3 lines through center (horizontal, vertical, diagonal)
-	const int r = 4;
+	const int r = 8;  // doubled for new screen
 	display.drawFastHLine(cx - r, cy, 2 * r + 1, SSD1306_WHITE);
 	display.drawFastVLine(cx, cy - r, 2 * r + 1, SSD1306_WHITE);
 	display.drawLine(cx - r + 1, cy - r + 1, cx + r - 1, cy + r - 1, SSD1306_WHITE);
@@ -2161,13 +2201,13 @@ static void drawBatteryTopRight()
 	if (lowBatt && ((millis() / 400) % 2) == 0)
 		return; // blink off every other 400ms interval
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 	char buf[8];
 	snprintf(buf, sizeof(buf), "%.1fV", batt);
 	int16_t x1, y1;
 	uint16_t w, h;
 	display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-	display.setCursor(SCREEN_WIDTH - (int16_t)w - SIDE_MARGIN, 2);
+	display.setCursor(SCREEN_WIDTH - (int16_t)w - SIDE_MARGIN, 4);
 	display.print(buf);
 }
 
@@ -2215,15 +2255,15 @@ void drawMainPage()
 
 	// outside temperature at fixed left margin, same vertical as battery
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 	if (!isnan(outsideTemp))
 	{
-		display.setCursor(SIDE_MARGIN, 2);
+		display.setCursor(SIDE_MARGIN, 4);
 		display.print(outsideTemp, 1);
 		int16_t otDegX = display.getCursorX();
-		display.drawCircle(otDegX + 2, 1, 1, SSD1306_WHITE);
+		display.drawCircle(otDegX + 3, 2, 2, SSD1306_WHITE);
 		if (outsideTemp <= 0.0f)
-			drawSnowflakeWarning(otDegX + 8, 5);
+			drawSnowflakeWarning(otDegX + 16, 8);
 	}
 
 	// coolant temperature (OBD2 PID 0x05) – bottom right, above oil bar
@@ -2232,13 +2272,14 @@ void drawMainPage()
 		char cwBuf[8];
 		snprintf(cwBuf, sizeof(cwBuf), "%d", (int)round(coolantTempCached));
 		int16_t cx1, cy1; uint16_t cw, ch;
+		display.setTextSize(2);
 		display.getTextBounds(cwBuf, 0, 0, &cx1, &cy1, &cw, &ch);
-		display.setCursor(SCREEN_WIDTH - (int16_t)cw - 6 - SIDE_MARGIN, 47);
+		display.setCursor(SCREEN_WIDTH - (int16_t)cw - 22 - SIDE_MARGIN, 176);
 		display.print(cwBuf);
-		display.drawCircle(display.getCursorX() + 2, 46, 1, SSD1306_WHITE);
+		display.drawCircle(display.getCursorX() + 4, 174, 2, SSD1306_WHITE);
 	}
 
-	int16_t baselineY = 41;
+	int16_t baselineY = 154;
 	if (mainLeanActive)
 	{
 		// Always show peak (never live) – only goes up, held 4s after returning below 30°
@@ -2272,8 +2313,8 @@ void drawMainPage()
 		drawCenteredBigNumberWithDegree(shownOilInt2, baselineY);
 
 		display.setFont();
-		display.setTextSize(1);
-		display.setCursor(2, 46);
+		display.setTextSize(2);
+		display.setCursor(4, 173);
 		if (oilC < 60.0f)
 			display.print("COLD");
 	}
@@ -2295,23 +2336,23 @@ void drawMainPage()
 	if (btn.pressed && !mainLeanActive)
 	{
 		unsigned long held = millis() - btn.pressStartMs;
-		int barW = (int)((float)held / (float)MAIN_VOL_LONGPRESS_MS * 126.0f);
-		if (barW > 126) barW = 126;
+		int barW = (int)((float)held / (float)MAIN_VOL_LONGPRESS_MS * 274.0f);
+		if (barW > 274) barW = 274;
 		if (barW > 0)
-			display.fillRect(1, 63, barW, 1, SSD1306_WHITE);
+			display.fillRect(3, 236, barW, 3, SSD1306_WHITE);
 	}
 
 	// CAN offline indicator – unter Batterie wenn sichtbar, sonst an deren Stelle
 	if (isnan(vehicleSpeedCached))
 	{
 		display.setFont();
-		display.setTextSize(1);
+		display.setTextSize(2);
 		bool battVisible = !isnan(battVoltageCached) && battVoltageCached >= 1.0f &&
 		                   !(battVoltageCached < BATT_LOW_V && ((millis() / 400) % 2) == 0);
-		const int16_t bx = SCREEN_WIDTH - 22;
-		const int16_t by = battVisible ? 12 : 2;
-		display.drawRect(bx, by, 21, 10, SSD1306_WHITE);
-		display.setCursor(bx + 2, by + 1);
+		const int16_t bx = SCREEN_WIDTH - 50;
+		const int16_t by = battVisible ? 28 : 4;
+		display.drawRect(bx, by, 46, 20, SSD1306_WHITE);
+		display.setCursor(bx + 4, by + 2);
 		display.print("CAN");
 	}
 
@@ -2353,13 +2394,13 @@ void drawLeanPage()
 		centerValue = liveLean;
 	}
 
-	drawCenteredBigNumber((int)round(centerValue), 28);
+	drawCenteredBigNumber((int)round(centerValue), 105);
 
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
 	// Max lean left (bottom-left)
-	display.setCursor(2, display.height() - 9);
+	display.setCursor(2, display.height() - 20);
 	display.print("L:");
 	display.print(maxLeanLeft, 0);
 
@@ -2370,7 +2411,7 @@ void drawLeanPage()
 	display.getTextBounds(rStr, 0, 0, &x1, &y1, &w, &h);
 	int16_t xRight = SCREEN_WIDTH - (int16_t)w;
 
-	display.setCursor(xRight, SCREEN_HEIGHT - 9);
+	display.setCursor(xRight, SCREEN_HEIGHT - 20);
 	display.print(rStr);
 
 	drawLeanSemiGauge(rollUi);
@@ -2427,32 +2468,32 @@ void drawGPage()
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
 	// ---- Header labels ----
-	display.setCursor(2, 1);
+	display.setCursor(4, 4);
 	display.print("< BREMSEN");
-	display.setCursor(84, 1);
+	display.setCursor(184, 4);
 	display.print("GAS >");
 
-	// ---- Large current G value (kein "g") ----
+	// ---- Large current G value ----
 	char gBuf[8];
 	snprintf(gBuf, sizeof(gBuf), "%.2f", fabsf(gY));
 	display.setFont(&FreeSansBold12pt7b);
 	int16_t bx, by; uint16_t bw, bh;
 	display.getTextBounds(gBuf, 0, 0, &bx, &by, &bw, &bh);
-	display.setCursor((SCREEN_WIDTH - (int16_t)bw) / 2 - bx, 36);
+	display.setCursor((SCREEN_WIDTH - (int16_t)bw) / 2 - bx, 135);
 	display.print(gBuf);
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
-	// ---- Horizontal bar (y=42, h=8) ----
-	// range ±1.5g, centre at x=64, usable half-width = 58px
-	const int16_t BAR_Y  = 42;
-	const int16_t BAR_H  = 8;
-	const int16_t BAR_CX = 64;
+	// ---- Horizontal bar (y=158, h=30) ----
+	// range ±1.5g, centre at x=140, usable half-width = 127px
+	const int16_t BAR_Y  = 158;
+	const int16_t BAR_H  = 30;
+	const int16_t BAR_CX = 140;
 	const float   BAR_G  = 1.5f;
-	const int16_t BAR_HW = 58; // half-width in pixels
+	const int16_t BAR_HW = 127; // half-width in pixels
 	display.drawRect(BAR_CX - BAR_HW, BAR_Y, BAR_HW * 2, BAR_H, SSD1306_WHITE);
 	display.drawFastVLine(BAR_CX, BAR_Y, BAR_H, SSD1306_WHITE); // centre tick
 	// fill (gY positiv = Gas, gY negativ = Bremsen)
@@ -2474,22 +2515,22 @@ void drawGPage()
 	{
 		int16_t bx = BAR_CX + (int16_t)((maxGBrake / BAR_G) * (float)BAR_HW);
 		if (bx > BAR_CX + BAR_HW - 1) bx = BAR_CX + BAR_HW - 1;
-		display.drawFastVLine(bx, BAR_Y - 2, BAR_H + 4, SSD1306_WHITE);
+		display.drawFastVLine(bx, BAR_Y - 5, BAR_H + 10, SSD1306_WHITE);
 	}
 	if (maxGAccel > 0.01f)
 	{
 		int16_t ax = BAR_CX - (int16_t)((maxGAccel / BAR_G) * (float)BAR_HW);
 		if (ax < BAR_CX - BAR_HW + 1) ax = BAR_CX - BAR_HW + 1;
-		display.drawFastVLine(ax, BAR_Y - 2, BAR_H + 4, SSD1306_WHITE);
+		display.drawFastVLine(ax, BAR_Y - 5, BAR_H + 10, SSD1306_WHITE);
 	}
 
 	// ---- Peak values ----
 	char pbuf[10];
 	snprintf(pbuf, sizeof(pbuf), "M:%.2fg", maxGBrake);
-	display.setCursor(2, 54);
+	display.setCursor(4, 202);
 	display.print(pbuf);
 	snprintf(pbuf, sizeof(pbuf), "M:%.2fg", maxGAccel);
-	display.setCursor(128 - (int16_t)(strlen(pbuf) * 6) - 2, 54);
+	display.setCursor(280 - (int16_t)(strlen(pbuf) * 12) - 4, 202);
 	display.print(pbuf);
 
 	// ---- reset flash ----
@@ -2499,9 +2540,11 @@ void drawGPage()
 		bool on = ((now / 80) % 2) == 0;
 		if (on)
 		{
-			display.fillRect(36, 10, 56, 16, SSD1306_WHITE);
+			display.fillRect(79, 38, 122, 45, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
-			display.setCursor(48, 14);
+			display.setFont();
+			display.setTextSize(3);
+			display.setCursor(105, 53);
 			display.print("RESET");
 			display.setTextColor(SSD1306_WHITE);
 		}
@@ -2532,17 +2575,17 @@ void drawEnginePage()
 			snprintf(kmhBuf, sizeof(kmhBuf), "--");
 		int16_t x1, y1; uint16_t w, h;
 		display.getTextBounds(kmhBuf, 0, 0, &x1, &y1, &w, &h);
-		display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 30);
+		display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 100);
 		display.print(kmhBuf);
 		display.setFont();
 		// "km/h" label small, right of number
-		display.setTextSize(1);
-		display.setCursor((SCREEN_WIDTH + (int16_t)w) / 2 - x1 + 6, 15);
+		display.setTextSize(2);
+		display.setCursor((SCREEN_WIDTH + (int16_t)w) / 2 - x1 + 10, 60);
 		display.print("km/h");
 	}
 
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
 	// ---- Load % – bottom left ----
 	{
@@ -2551,7 +2594,7 @@ void drawEnginePage()
 			snprintf(buf, sizeof(buf), "Ld:%d%%", (int)round(engineLoadCached));
 		else
 			snprintf(buf, sizeof(buf), "Ld:--");
-		display.setCursor(0, 34);
+		display.setCursor(0, 128);
 		display.print(buf);
 	}
 
@@ -2564,13 +2607,13 @@ void drawEnginePage()
 			snprintf(buf, sizeof(buf), "--rpm");
 		int16_t x1, y1; uint16_t w, h;
 		display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-		display.setCursor(SCREEN_WIDTH - (int16_t)w - 1, 34);
+		display.setCursor(SCREEN_WIDTH - (int16_t)w - 2, 128);
 		display.print(buf);
 	}
 
 	// ---- Throttle bar ----
 	{
-		const int bx = 0, by = 43, bw = 128, bh = 9;
+		const int bx = 0, by = 156, bw = 280, bh = 30;
 		display.drawRect(bx, by, bw, bh, SSD1306_WHITE);
 		if (!isnan(throttlePosCached))
 		{
@@ -2587,7 +2630,7 @@ void drawEnginePage()
 			display.getTextBounds(tbuf, 0, 0, &x1, &y1, &w, &h);
 			bool fillHigh = (!isnan(throttlePosCached) && throttlePosCached >= 50.0f);
 			display.setTextColor(fillHigh ? SSD1306_BLACK : SSD1306_WHITE);
-			display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, by + 1);
+			display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, by + 4);
 			display.print(tbuf);
 			display.setTextColor(SSD1306_WHITE);
 		}
@@ -2595,7 +2638,7 @@ void drawEnginePage()
 
 	// ---- 0-100 timer – bottom row ----
 	{
-		display.setCursor(30, 57);
+		display.setCursor(66, 214);
 		switch (sprint100State)
 		{
 			case S100_IDLE:
@@ -2609,7 +2652,7 @@ void drawEnginePage()
 				float elapsed = (float)(millis() - sprint100StartMs) / 1000.0f;
 				char tbuf[16];
 				snprintf(tbuf, sizeof(tbuf), "0-100: %.1fs...", elapsed);
-				display.setCursor(0, 57);
+				display.setCursor(0, 214);
 				display.print(tbuf);
 				break;
 			}
@@ -2619,7 +2662,7 @@ void drawEnginePage()
 				snprintf(tbuf, sizeof(tbuf), "0-100: %.2fs", sprint100Result);
 				int16_t x1, y1; uint16_t w, h;
 				display.getTextBounds(tbuf, 0, 0, &x1, &y1, &w, &h);
-				display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 57);
+				display.setCursor((SCREEN_WIDTH - (int16_t)w) / 2 - x1, 214);
 				display.print(tbuf);
 				break;
 			}
@@ -2651,12 +2694,12 @@ void drawRaceBoxPage()
 		const char* title = "RaceBox";
 		int16_t x1, y1; uint16_t tw, th;
 		display.getTextBounds(title, 0, 0, &x1, &y1, &tw, &th);
-		display.setCursor((128 - (int16_t)tw) / 2, 0);
+		display.setCursor((SCREEN_WIDTH - (int16_t)tw) / 2, 2);
 		display.print(title);
 	}
-	display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+	display.drawLine(0, 22, SCREEN_WIDTH - 1, 22, SSD1306_WHITE);
 
-	const int BX = 50, BW = 32; // Badge x und Breite
+	const int BX = 109, BW = 70; // Badge x und Breite
 
 	bool bleAlive = raceboxBleAliveLastMs > 0 && (millis() - raceboxBleAliveLastMs) < RACEBOX_BLE_ALIVE_TIMEOUT_MS;
 	bool raceboxOn = raceboxBle || bleAlive;
@@ -2664,51 +2707,51 @@ void drawRaceBoxPage()
 	// BLT-Status Hilfslambda (gemeinsam für beide Zustände)
 	auto drawBlt = [&](int iconY, int textY, int badgeY, int badgeFillY) {
 		display.drawBitmap(0, iconY, icon_blitz, 12, 12, SSD1306_WHITE);
-		display.setCursor(14, textY);
+		display.setCursor(16, textY);
 		display.print("BLT");
 		bool alive = blitzerAliveReceived && (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
 		if (blitzerAliveReceived && alive) {
-			display.fillRoundRect(BX, badgeY, BW, 12, 3, SSD1306_WHITE);
+			display.fillRoundRect(BX, badgeY, BW, 20, 4, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
 			printCentered(BX, BW, badgeFillY, "ON");
 			display.setTextColor(SSD1306_WHITE);
 		} else if (blitzerAliveReceived && !alive) {
 			if (((millis() / 400) % 2) == 0)
-				display.drawRoundRect(BX, badgeY, BW, 12, 3, SSD1306_WHITE);
+				display.drawRoundRect(BX, badgeY, BW, 20, 4, SSD1306_WHITE);
 			printCentered(BX, BW, badgeFillY, "OFF");
 		} else {
-			display.drawRoundRect(BX, badgeY, BW, 12, 3, SSD1306_WHITE);
+			display.drawRoundRect(BX, badgeY, BW, 20, 4, SSD1306_WHITE);
 			printCentered(BX, BW, badgeFillY, "OFF");
 		}
 	};
 
 	if (!raceboxOn) {
-		// RaceBox ist aus: RaceBox + Co-Driver Status, Badges rechtsbündig ausgerichtet
-		const int OBX = 90, OBW = 32; // Badge-Spalte rechtsbündig
+		// RaceBox ist aus: RaceBox + Co-Driver Status
+		const int OBX = 197, OBW = 70;
 
 		// Zeile 1: RaceBox
-		display.setCursor(6, 20);
+		display.setCursor(8, 60);
 		display.print("RaceBox");
-		display.drawRoundRect(OBX, 18, OBW, 12, 3, SSD1306_WHITE);
-		printCentered(OBX, OBW, 21, "OFF");
+		display.drawRoundRect(OBX, 56, OBW, 20, 4, SSD1306_WHITE);
+		printCentered(OBX, OBW, 59, "OFF");
 
 		// Zeile 2: Co-Driver
-		display.setCursor(6, 40);
+		display.setCursor(8, 110);
 		display.print("Co-Driver");
 		{
 			bool alive = blitzerAliveReceived && (millis() - blitzerAliveLastMs) < BLITZER_ALIVE_TIMEOUT_MS;
 			if (blitzerAliveReceived && alive) {
-				display.fillRoundRect(OBX, 38, OBW, 12, 3, SSD1306_WHITE);
+				display.fillRoundRect(OBX, 106, OBW, 20, 4, SSD1306_WHITE);
 				display.setTextColor(SSD1306_BLACK);
-				printCentered(OBX, OBW, 41, "ON");
+				printCentered(OBX, OBW, 109, "ON");
 				display.setTextColor(SSD1306_WHITE);
 			} else if (blitzerAliveReceived && !alive) {
 				if (((millis() / 400) % 2) == 0)
-					display.drawRoundRect(OBX, 38, OBW, 12, 3, SSD1306_WHITE);
-				printCentered(OBX, OBW, 41, "OFF");
+					display.drawRoundRect(OBX, 106, OBW, 20, 4, SSD1306_WHITE);
+				printCentered(OBX, OBW, 109, "OFF");
 			} else {
-				display.drawRoundRect(OBX, 38, OBW, 12, 3, SSD1306_WHITE);
-				printCentered(OBX, OBW, 41, "OFF");
+				display.drawRoundRect(OBX, 106, OBW, 20, 4, SSD1306_WHITE);
+				printCentered(OBX, OBW, 109, "OFF");
 			}
 		}
 
@@ -2716,56 +2759,56 @@ void drawRaceBoxPage()
 		// RaceBox ist an: BLE, REC, GPS und BLT anzeigen
 
 		// BLE  (row 1)
-		display.drawBitmap(0, 10, icon_bt, 12, 12, SSD1306_WHITE);
-		display.setCursor(14, 12);
+		display.drawBitmap(2, 30, icon_bt, 12, 12, SSD1306_WHITE);
+		display.setCursor(18, 30);
 		display.print("BLE");
 		if (raceboxBle) {
-			display.fillRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
+			display.fillRoundRect(BX, 28, BW, 18, 4, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
-			printCentered(BX, BW, 12, "CONN");
+			printCentered(BX, BW, 30, "CONN");
 			display.setTextColor(SSD1306_WHITE);
 		} else {
-			display.drawRoundRect(BX, 11, BW, 10, 3, SSD1306_WHITE);
-			printCentered(BX, BW, 12, "ON");
+			display.drawRoundRect(BX, 28, BW, 18, 4, SSD1306_WHITE);
+			printCentered(BX, BW, 30, "ON");
 		}
 
 		// REC  (row 2)
-		display.drawBitmap(0, 23, icon_rec, 12, 12, SSD1306_WHITE);
-		display.setCursor(14, 25);
+		display.drawBitmap(2, 60, icon_rec, 12, 12, SSD1306_WHITE);
+		display.setCursor(18, 60);
 		display.print("REC");
 		if (raceboxRec) {
-			display.fillRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
+			display.fillRoundRect(BX, 58, BW, 18, 4, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
-			printCentered(BX, BW, 25, "REC");
+			printCentered(BX, BW, 60, "REC");
 			display.setTextColor(SSD1306_WHITE);
 		} else {
-			display.drawRoundRect(BX, 24, BW, 10, 3, SSD1306_WHITE);
-			printCentered(BX, BW, 25, "---");
+			display.drawRoundRect(BX, 58, BW, 18, 4, SSD1306_WHITE);
+			printCentered(BX, BW, 60, "---");
 		}
 
 		// GPS  (row 3)
-		display.drawBitmap(0, 36, icon_gps, 12, 12, SSD1306_WHITE);
-		display.setCursor(14, 38);
+		display.drawBitmap(2, 90, icon_gps, 12, 12, SSD1306_WHITE);
+		display.setCursor(18, 90);
 		display.print("GPS");
 		if (raceboxGps) {
-			display.fillRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
+			display.fillRoundRect(BX, 88, BW, 18, 4, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
-			printCentered(BX, BW, 38, "FIX");
+			printCentered(BX, BW, 90, "FIX");
 			display.setTextColor(SSD1306_WHITE);
 		} else {
-			display.drawRoundRect(BX, 37, BW, 10, 3, SSD1306_WHITE);
-			printCentered(BX, BW, 38, "---");
+			display.drawRoundRect(BX, 88, BW, 18, 4, SSD1306_WHITE);
+			printCentered(BX, BW, 90, "---");
 		}
 
 		// BLT  (row 4)
-		drawBlt(49, 51, 50, 53);
+		drawBlt(120, 120, 118, 120);
 	}
 
 	// Schaltflächen-Indikator oben rechts
 	if (raceboxBtnUntilMs > 0 && millis() < raceboxBtnUntilMs) {
-		display.fillRoundRect(95, 0, 33, 9, 2, SSD1306_WHITE);
+		display.fillRoundRect(SCREEN_WIDTH - 80, 2, 72, 18, 4, SSD1306_WHITE);
 		display.setTextColor(SSD1306_BLACK);
-		printCentered(95, 33, 1, "REC");
+		printCentered(SCREEN_WIDTH - 80, 72, 4, "REC");
 		display.setTextColor(SSD1306_WHITE);
 	}
 
@@ -2782,21 +2825,21 @@ void drawVolumePage()
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
 	// Title centred
 	{
 		const char* title = "VOLUME";
 		int16_t x1, y1; uint16_t tw, th;
 		display.getTextBounds(title, 0, 0, &x1, &y1, &tw, &th);
-		display.setCursor((128 - (int16_t)tw) / 2, 1);
+		display.setCursor((SCREEN_WIDTH - (int16_t)tw) / 2, 4);
 		display.print(title);
 	}
-	display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+	display.drawLine(0, 24, SCREEN_WIDTH - 1, 24, SSD1306_WHITE);
 
 	// BT icon + connection status
-	display.drawBitmap(0, 11, icon_bt, 12, 12, SSD1306_WHITE);
-	display.setCursor(15, 12);
+	display.drawBitmap(2, 30, icon_bt, 12, 12, SSD1306_WHITE);
+	display.setCursor(20, 30);
 	bool btConn = bleKeyboard.isConnected();
 	if (btConn)
 	{
@@ -2808,29 +2851,29 @@ void drawVolumePage()
 			display.print("Suche...");
 	}
 
-	// Vol+ row: + symbol = lauter (halten)
-	display.setTextSize(2);
-	display.setCursor(2, 27);
+	// Vol+ row
+	display.setTextSize(3);
+	display.setCursor(4, 70);
 	display.print("+");
-	display.setTextSize(1);
-	display.setCursor(20, 29);
+	display.setTextSize(2);
+	display.setCursor(40, 73);
 	display.print("Lauter  (halten)");
 
-	// Vol- row: - symbol = leiser (kurz + exit)
-	display.setTextSize(2);
-	display.setCursor(4, 41);
+	// Vol- row
+	display.setTextSize(3);
+	display.setCursor(8, 120);
 	display.print("-");
-	display.setTextSize(1);
-	display.setCursor(20, 43);
+	display.setTextSize(2);
+	display.setCursor(40, 123);
 	display.print("Leiser  (kurz)");
 
 	// Auto-close countdown bar at bottom
 	unsigned long elapsed = millis() - volLastInteractMs;
 	float frac = 1.0f - clampf((float)elapsed / (float)VOL_PAGE_TIMEOUT_MS, 0.0f, 1.0f);
-	int barW = (int)(118.0f * frac);
-	display.drawRect(5, 57, 118, 5, SSD1306_WHITE);
+	int barW = (int)(258.0f * frac);
+	display.drawRect(11, 214, 258, 10, SSD1306_WHITE);
 	if (barW > 0)
-		display.fillRect(5, 57, barW, 5, SSD1306_WHITE);
+		display.fillRect(11, 214, barW, 10, SSD1306_WHITE);
 
 	drawRpmRedlineBorder();
 	display.display();
@@ -2847,32 +2890,31 @@ void drawSettingsPage()
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
 	// Title bar
-	display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+	display.fillRect(0, 0, 280, 22, SSD1306_WHITE);
 	display.setTextColor(SSD1306_BLACK);
 	// Left: ESP temperature
 	char hdrBuf[8];
 	snprintf(hdrBuf, sizeof(hdrBuf), "%.0fC", (double)temperatureRead());
-	display.setCursor(2, 2);
+	display.setCursor(4, 4);
 	display.print(hdrBuf);
 	// Centre: title
-	display.setCursor(38, 2);
+	display.setCursor(90, 4);
 	display.print("SETTINGS");
 	// Right: RAM used%
 	uint8_t ramUsedPct = (uint8_t)((ESP.getHeapSize() - ESP.getFreeHeap()) * 100 / ESP.getHeapSize());
 	snprintf(hdrBuf, sizeof(hdrBuf), "%u%%", ramUsedPct);
-	int16_t rx = 128 - (int16_t)(strlen(hdrBuf) * 6) - 2;
-	display.setCursor(rx, 2);
+	int16_t rx = 280 - (int16_t)(strlen(hdrBuf) * 12) - 4;
+	display.setCursor(rx, 4);
 	display.print(hdrBuf);
 	display.setTextColor(SSD1306_WHITE);
 
-	// Items – 10px per row, 5 visible at a time (title=10px, bottom bar=1px → 53px usable)
-	// Scroll window follows selected item.
-	const int16_t ITEM_H      = 10;
+	// Items – 20px per row, 5 visible at a time
+	const int16_t ITEM_H      = 20;
 	const int16_t VISIBLE     = 5;
-	const int16_t LIST_TOP    = 11; // first item y
+	const int16_t LIST_TOP    = 24;
 
 	const char* labels[SET_COUNT] = {
 		"Brightness",
@@ -2897,10 +2939,10 @@ void drawSettingsPage()
 		int16_t y = LIST_TOP + (i - scrollTop) * ITEM_H;
 
 		if (i == (int8_t)settingsIdx)
-			display.fillRect(0, y, 128, ITEM_H - 1, SSD1306_WHITE);
+			display.fillRect(0, y, 280, ITEM_H - 1, SSD1306_WHITE);
 
 		display.setTextColor(i == (int8_t)settingsIdx ? SSD1306_BLACK : SSD1306_WHITE);
-		display.setCursor(2, y + 1);
+		display.setCursor(4, y + 2);
 		display.print(labels[i]);
 
 		switch (i)
@@ -2940,8 +2982,8 @@ void drawSettingsPage()
 				break;
 		}
 
-		int16_t vx = 128 - (int16_t)(strlen(valBuf) * 6) - 2;
-		display.setCursor(vx, y + 1);
+		int16_t vx = 280 - (int16_t)(strlen(valBuf) * 12) - 4;
+		display.setCursor(vx, y + 2);
 		display.print(valBuf);
 	}
 	display.setTextColor(SSD1306_WHITE);
@@ -2951,18 +2993,18 @@ void drawSettingsPage()
 	if (btn.pressed)
 	{
 		unsigned long held = now - settingsPressStartMs;
-		int barW = (int)((float)held / (float)SETTINGS_LONGPRESS_MS * 128.0f);
-		if (barW > 128) barW = 128;
+		int barW = (int)((float)held / (float)SETTINGS_LONGPRESS_MS * 280.0f);
+		if (barW > 280) barW = 280;
 		if (barW > 0)
-			display.fillRect(0, 63, barW, 1, SSD1306_WHITE);
+			display.fillRect(0, 236, barW, 4, SSD1306_WHITE);
 	}
 
 	// timeout countdown bar (bottom line shrinks as timeout approaches)
 	{
 		unsigned long elapsed = now - settingsLastActMs;
-		int barW = 128 - (int)((float)elapsed / (float)SETTINGS_TIMEOUT_MS * 128.0f);
+		int barW = 280 - (int)((float)elapsed / (float)SETTINGS_TIMEOUT_MS * 280.0f);
 		if (barW < 0) barW = 0;
-		display.drawFastHLine(128 - barW, 63, barW, SSD1306_WHITE);
+		display.drawFastHLine(280 - barW, 237, barW, SSD1306_WHITE);
 	}
 
 	display.display();
@@ -2974,10 +3016,10 @@ void calibrateRollOffset()
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
 	display.setFont();
-	display.setTextSize(1);
-	display.setCursor(10, 10);
+	display.setTextSize(2);
+	display.setCursor(20, 80);
 	display.print("Calibrating...");
-	display.setCursor(10, 24);
+	display.setCursor(20, 110);
 	display.print("Hold still");
 	display.display();
 
@@ -3000,7 +3042,7 @@ void calibrateRollOffset()
 	rollOffsetDeg = (n > 0) ? (float)(sum / n) : 0.0f;
 
 	display.clearDisplay();
-	display.setCursor(10, 22);
+	display.setCursor(20, 100);
 	display.print("Offset set");
 	display.display();
 	delay(250);
@@ -3013,14 +3055,14 @@ void calibrateRollOffset()
 static void drawSelfTestLineProgress(int y, const char *label, int8_t st)
 {
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
 	// label links
-	display.setCursor(8, y);
+	display.setCursor(18, y);
 	display.print(label);
 
-	// status immer bei fester X-Position (60) → alle "OK" auf gleicher Höhe
-	const int16_t statusX = 60;
+	// status immer bei fester X-Position
+	const int16_t statusX = 131;
 	display.setCursor(statusX, y);
 
 	if (st < 0)
@@ -3038,7 +3080,7 @@ static void drawSelfTestLineProgress(int y, const char *label, int8_t st)
 		bool on = ((millis() / 160) % 2) == 0;
 		if (on)
 		{
-			display.fillRect(statusX - 1, y - 1, 30, 10, SSD1306_WHITE);
+			display.fillRect(statusX - 2, y - 2, 60, 20, SSD1306_WHITE);
 			display.setTextColor(SSD1306_BLACK);
 			display.setCursor(statusX, y);
 			display.print("FAIL");
@@ -3052,17 +3094,17 @@ static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stAds, int8_t s
 	display.clearDisplay();
 	display.setTextColor(SSD1306_WHITE);
 	display.setFont();
-	display.setTextSize(1);
+	display.setTextSize(2);
 
-	display.setCursor(8, 6);
+	display.setCursor(18, 20);
 	display.print("Self-Test");
 
-	drawSelfTestLineProgress(20, "BNO085",  stBno);
-	drawSelfTestLineProgress(30, "BH1750",  stBh);
-	drawSelfTestLineProgress(40, "ADS1115", stAds);
-	drawSelfTestLineProgress(50, "EEPROM",  stEe);
+	drawSelfTestLineProgress(55,  "BNO085",  stBno);
+	drawSelfTestLineProgress(80,  "BH1750",  stBh);
+	drawSelfTestLineProgress(105, "ADS1115", stAds);
+	drawSelfTestLineProgress(130, "EEPROM",  stEe);
 
-	const int barX = 8, barY = 59, barW = 112, barH = 4;
+	const int barX = 18, barY = 214, barW = 245, barH = 12;
 	display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
 	int fill = (int)((barW - 2) * clampf(prog01, 0.0f, 1.0f));
 	if (fill > 0)
@@ -3263,17 +3305,17 @@ void setup()
 	// otherwise specify sck, miso, mosi, ss
 	SPI.begin(OLED_CLK, /*MISO*/ -1, OLED_MOSI, OLED_CS);
 
-	if (!display.begin(SSD1306_SWITCHCAPVCC))
-	{
-		while (true) { delay(100); }
-	}
-	
-	display.setRotation(0);
-	display.setTextColor(SSD1306_WHITE);
-	display.clearDisplay();
-	display.display();
+	// Initialise the physical ST7789 hardware
+	_tft_hw.init(240, 280);         // physical pixels: 240 × 280
+	_tft_hw.setRotation(1);         // landscape: 280 × 240
+	_tft_hw.setSPISpeed(40000000);  // 40 MHz – fast enough for 40+ fps frame push
+	_tft_hw.fillScreen(ST77XX_BLACK);
 
-	oledSetContrast(CONTRAST_DAY);
+	// Initialise the canvas (framebuffer)
+	display.setTextColor(ST77XX_WHITE);
+	display.clearDisplay();
+
+	// oledSetContrast is a no-op for ST7789
 
 	bootProgressInitAndMaybeCalibrate();
 
