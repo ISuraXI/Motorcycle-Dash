@@ -84,6 +84,8 @@
 #include <SPI.h>
 #include <math.h>
 #include <EEPROM.h>
+#include <FastLED.h>
+#include <Adafruit_NeoPixel.h>
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -132,6 +134,27 @@
 #define OLED_DC    5 // DC   -> GPIO 5
 #define OLED_RST   6 // RST  -> GPIO 6
 #define OLED_CS   10 // CS   -> GPIO 10
+
+#define LED_STRIP_PIN   21 // data pin for WS2812B (was 21 originally)
+#define LED_STRIP_COUNT 56
+CRGB leds[LED_STRIP_COUNT];
+
+// Use Adafruit NeoPixel backend instead of FastLED if set to 1
+#define USE_NEOPIXEL_BACKEND 1
+#if USE_NEOPIXEL_BACKEND
+Adafruit_NeoPixel strip(LED_STRIP_COUNT, LED_STRIP_PIN, NEO_GRB + NEO_KHZ800);
+#endif
+
+// Enable LED strip: set to 1 to initialize after boot, 0 to keep disabled
+#define LED_STRIP_ENABLED 1
+
+// If set to 1, LEDs will only be initialized after a long press on BTN_PIN
+// (not used now; initialization happens directly at boot)
+#define LED_INIT_ON_BUTTON 0
+
+// runtime flag set true after successful init
+static bool ledStripInited = false;
+static bool bootInProgress = true;
 
 // ---- Physical TFT hardware driver (SPI device) ----
 static Adafruit_ST7789 _tft_hw(&SPI, OLED_CS, OLED_DC, OLED_RST);
@@ -269,7 +292,7 @@ float BATT_LOW_V = 10.5f;           // battery low warning threshold (flash text
 // #define TEST_MODE
 // When active: sensors cycle through normal range, warnings NOT triggered
 // Use TEST_MODE_WARNINGS to also test warning screens
-// #define TEST_MODE_WARNINGS
+#define TEST_MODE_WARNINGS
 // Main demo: fixed oil/batt/temp, lean oscillates 0→41→0 (pause 8s) 0→-51→0 (pause 8s)
 // #define TEST_MODE_MAIN
 
@@ -626,6 +649,9 @@ void drawEnginePage();
 void drawRaceBoxPage();
 void drawVolumePage();
 
+void initLedStrip();
+void updateLedStrip(unsigned long now);
+void updateBootProgressLed(float prog01);
 void calibrateRollOffset();
 void showReadyScreen();
 
@@ -3077,9 +3103,9 @@ static void renderBootProgress(int8_t stBno, int8_t stBh, int8_t stAds, int8_t s
 	display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
 	int fill = (int)((barW - 2) * clampf(prog01, 0.0f, 1.0f));
 	if (fill > 0)
-		display.fillRect(barX + 1, barY + 1, fill, barH - 2, SSD1306_WHITE);
-
+			display.fillRect(barX + 1, barY + 1, fill, barH - 2, ST77XX_GREEN);
 	display.display();
+	updateBootProgressLed(prog01);
 }
 
 void bootProgressInitAndMaybeCalibrate()
@@ -3210,6 +3236,166 @@ void showReadyScreen()
 }
 
 // =========================================================
+// LED strip helpers
+// =========================================================
+void initLedStrip()
+{
+#if USE_NEOPIXEL_BACKEND
+	strip.begin();
+	strip.setBrightness(90);
+	strip.fill(strip.Color(0, 0, 0));
+	strip.show();
+#else
+	FastLED.addLeds<WS2812B, LED_STRIP_PIN, GRB>(leds, LED_STRIP_COUNT);
+	FastLED.setBrightness(140);
+	fill_solid(leds, LED_STRIP_COUNT, CRGB::Black);
+	FastLED.show();
+#endif
+}
+
+void updateBootProgressLed(float prog01)
+{
+	if (!ledStripInited || !bootInProgress)
+		return;
+
+	int fillCount = (int)roundf(clampf(prog01, 0.0f, 1.0f) * (float)LED_STRIP_COUNT);
+	fillCount = constrain(fillCount, 0, LED_STRIP_COUNT);
+
+#if USE_NEOPIXEL_BACKEND
+	for (int i = 0; i < LED_STRIP_COUNT; ++i)
+	{
+		if (i < fillCount)
+			strip.setPixelColor(i, strip.Color(0, 80, 0));
+		else
+			strip.setPixelColor(i, strip.Color(0, 0, 0));
+	}
+	if (fillCount > 0)
+		strip.setPixelColor(fillCount - 1, strip.Color(0, 180, 0));
+	strip.show();
+#else
+	for (int i = 0; i < LED_STRIP_COUNT; ++i)
+	{
+		if (i < fillCount)
+			leds[i] = CRGB(0, 80, 0);
+		else
+			leds[i] = CRGB::Black;
+	}
+	if (fillCount > 0)
+		leds[fillCount - 1] = CRGB(0, 180, 0);
+	FastLED.show();
+#endif
+}
+
+void updateLedStrip(unsigned long now)
+{
+	if (!ledStripInited) return;
+
+	bool oilTempWarning = (!isnan(oilTempCached) && oilTempCached >= OIL_CRITICAL_C);
+	bool coolantTempWarning = (!isnan(coolantTempCached) && coolantTempCached >= 120.0f);
+
+	// Highest priority: blitzer warning flashes the whole strip white.
+	if (now < blitzerActiveUntilMs)
+	{
+		bool flashOn = ((now / 160) & 1) == 0;
+#if USE_NEOPIXEL_BACKEND
+		uint32_t color = flashOn ? strip.Color(255,255,255) : strip.Color(0,0,0);
+		for (int i = 0; i < LED_STRIP_COUNT; ++i) strip.setPixelColor(i, color);
+		strip.show();
+#else
+		fill_solid(leds, LED_STRIP_COUNT, flashOn ? CRGB::White : CRGB::Black);
+		FastLED.show();
+#endif
+		return;
+	}
+
+	// High-temperature warning: orange flash for oil or water overheat.
+	if (oilTempWarning || coolantTempWarning)
+	{
+		bool flashOn = ((now / 240) & 1) == 0;
+#if USE_NEOPIXEL_BACKEND
+		uint32_t color = flashOn ? strip.Color(255, 128, 0) : strip.Color(0,0,0);
+		for (int i = 0; i < LED_STRIP_COUNT; ++i) strip.setPixelColor(i, color);
+		strip.show();
+#else
+		fill_solid(leds, LED_STRIP_COUNT, flashOn ? CRGB(255, 128, 0) : CRGB::Black);
+		FastLED.show();
+#endif
+		return;
+	}
+
+	// Idle / no data: LEDs remain off before boot and after boot until RPM is available.
+	if (isnan(engineRpmCached) || engineRpmCached <= 0.0f)
+	{
+#if USE_NEOPIXEL_BACKEND
+		for (int i = 0; i < LED_STRIP_COUNT; ++i)
+		{
+			strip.setPixelColor(i, strip.Color(0, 0, 0));
+		}
+		strip.show();
+#else
+		fill_solid(leds, LED_STRIP_COUNT, CRGB::Black);
+		FastLED.show();
+#endif
+		return;
+	}
+
+	float rpm = engineRpmCached;
+	float level = clampf((rpm - 7200.0f) / (9800.0f - 7200.0f), 0.0f, 1.0f);
+
+	if (level < 0.02f)
+	{
+		// Kein animierter Zustand bei niedriger Drehzahl: LEDs bleiben aus.
+#if USE_NEOPIXEL_BACKEND
+		for (int i = 0; i < LED_STRIP_COUNT; ++i) strip.setPixelColor(i, strip.Color(0,0,0));
+		strip.show();
+#else
+		fill_solid(leds, LED_STRIP_COUNT, CRGB::Black);
+		FastLED.show();
+#endif
+	}
+	else if (level < 0.95f)
+	{
+#if USE_NEOPIXEL_BACKEND
+		for (int i = 0; i < LED_STRIP_COUNT; ++i) strip.setPixelColor(i, strip.Color(0,0,0));
+		int fillCount = (int)roundf(level * (float)(LED_STRIP_COUNT / 2));
+		fillCount = constrain(fillCount, 0, LED_STRIP_COUNT / 2);
+		for (int i = 0; i < fillCount; ++i)
+		{
+			uint8_t bright = (uint8_t)map(i, 0, max(1, fillCount - 1), 70, 255);
+			strip.setPixelColor(i, strip.Color(bright,0,0));
+			strip.setPixelColor(LED_STRIP_COUNT - 1 - i, strip.Color(bright,0,0));
+		}
+		strip.show();
+#else
+		fill_solid(leds, LED_STRIP_COUNT, CRGB::Black);
+		int fillCount = (int)roundf(level * (float)(LED_STRIP_COUNT / 2));
+		fillCount = constrain(fillCount, 0, LED_STRIP_COUNT / 2);
+		for (int i = 0; i < fillCount; ++i)
+		{
+			uint8_t bright = (uint8_t)map(i, 0, max(1, fillCount - 1), 70, 255);
+			CRGB c = CHSV(0, 255, bright);
+			leds[i] = c;
+			leds[LED_STRIP_COUNT - 1 - i] = c;
+		}
+		FastLED.show();
+#endif
+	}
+	else
+	{
+#if USE_NEOPIXEL_BACKEND
+		bool blink = ((now / 120) & 1) == 0;
+		uint32_t color = blink ? strip.Color(255,0,0) : strip.Color(80,0,0);
+		for (int i = 0; i < LED_STRIP_COUNT; ++i) strip.setPixelColor(i, color);
+		strip.show();
+#else
+		bool blink = ((now / 120) & 1) == 0;
+		fill_solid(leds, LED_STRIP_COUNT, blink ? CRGB::Red : CRGB::DarkRed);
+		FastLED.show();
+#endif
+	}
+}
+
+// =========================================================
 // Setup / Loop
 // =========================================================
 void setup()
@@ -3226,6 +3412,12 @@ void setup()
 	pinMode(RACEBOX_BLE_PIN, INPUT_PULLUP); // cathode: LOW = LED on
 	pinMode(RACEBOX_REC_PIN, INPUT_PULLUP); // cathode: LOW = LED on
 	pinMode(BLITZER_PIN, INPUT_PULLUP); // LOW = blitzer detected (active low)
+	pinMode(LED_STRIP_PIN, OUTPUT); // WS2812 data pin
+
+	#if LED_STRIP_ENABLED
+		initLedStrip();
+		ledStripInited = true;
+	#endif
 	// Blitzer-Warner heartbeat LED is measured via ADS1115 AIN1 (no GPIO needed)
 
 	Wire.begin(SDA_PIN, SCL_PIN);
@@ -3302,6 +3494,8 @@ void setup()
 
 	// BLE HID keyboard for media volume control (NimBLE backend = stable address)
 	bleKeyboard.begin();
+
+	bootInProgress = false;
 }
 
 void loop()
@@ -3347,7 +3541,17 @@ void loop()
 	}
 
 	static unsigned long lastDraw = 0;
+	static unsigned long lastLedUpdateMs = 0;
 	unsigned long now = millis();
+
+	if (now - lastLedUpdateMs >= 20)
+	{
+		lastLedUpdateMs = now;
+		if (ledStripInited)
+			updateLedStrip(now);
+	}
+
+	// No button gating: LEDs are initialized directly at boot if enabled.
 
 	if (now - lastDraw >= 75)
 	{
