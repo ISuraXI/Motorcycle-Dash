@@ -3355,27 +3355,56 @@ void updateLedStrip(unsigned long now)
 	}
 	else if (level < 0.95f)
 	{
+		int halfCount = LED_STRIP_COUNT / 2;
+		int fillCount = (int)roundf(level * (float)halfCount);
+		fillCount = constrain(fillCount, 0, halfCount);
+
 #if USE_NEOPIXEL_BACKEND
-		for (int i = 0; i < LED_STRIP_COUNT; ++i) strip.setPixelColor(i, strip.Color(0,0,0));
-		int fillCount = (int)roundf(level * (float)(LED_STRIP_COUNT / 2));
-		fillCount = constrain(fillCount, 0, LED_STRIP_COUNT / 2);
+		for (int i = 0; i < LED_STRIP_COUNT; ++i)
+			strip.setPixelColor(i, strip.Color(0, 0, 0));
+
 		for (int i = 0; i < fillCount; ++i)
 		{
-			uint8_t bright = (uint8_t)map(i, 0, max(1, fillCount - 1), 70, 255);
-			strip.setPixelColor(i, strip.Color(bright,0,0));
-			strip.setPixelColor(LED_STRIP_COUNT - 1 - i, strip.Color(bright,0,0));
+			int idx = i;
+			float progress = (float)i / max(1, fillCount - 1);
+			float brightF = 140.0f + (255.0f - 140.0f) * progress;
+			float warmF = 60.0f - (60.0f - 0.0f) * progress;
+			uint8_t bright = (uint8_t)brightF;
+			uint8_t warm = (uint8_t)warmF;
+
+			if (i == fillCount - 1)
+			{
+				strip.setPixelColor(idx, strip.Color(255, 0, 0));
+				strip.setPixelColor(LED_STRIP_COUNT - 1 - idx, strip.Color(255, 0, 0));
+			}
+			else
+			{
+				strip.setPixelColor(idx, strip.Color(bright, warm, 0));
+				strip.setPixelColor(LED_STRIP_COUNT - 1 - idx, strip.Color(bright, warm, 0));
+			}
 		}
 		strip.show();
 #else
 		fill_solid(leds, LED_STRIP_COUNT, CRGB::Black);
-		int fillCount = (int)roundf(level * (float)(LED_STRIP_COUNT / 2));
-		fillCount = constrain(fillCount, 0, LED_STRIP_COUNT / 2);
 		for (int i = 0; i < fillCount; ++i)
 		{
-			uint8_t bright = (uint8_t)map(i, 0, max(1, fillCount - 1), 70, 255);
-			CRGB c = CHSV(0, 255, bright);
-			leds[i] = c;
-			leds[LED_STRIP_COUNT - 1 - i] = c;
+			int idx = i;
+			float progress = (float)i / max(1, fillCount - 1);
+			float brightF = 140.0f + (255.0f - 140.0f) * progress;
+			float warmF = 60.0f - (60.0f - 0.0f) * progress;
+			uint8_t bright = (uint8_t)brightF;
+			uint8_t warm = (uint8_t)warmF;
+
+			if (i == fillCount - 1)
+			{
+				leds[idx] = CRGB(255, 0, 0);
+				leds[LED_STRIP_COUNT - 1 - idx] = CRGB(255, 0, 0);
+			}
+			else
+			{
+				leds[idx] = CRGB(bright, warm, 0);
+				leds[LED_STRIP_COUNT - 1 - idx] = CRGB(bright, warm, 0);
+			}
 		}
 		FastLED.show();
 #endif
@@ -3384,12 +3413,12 @@ void updateLedStrip(unsigned long now)
 	{
 #if USE_NEOPIXEL_BACKEND
 		bool blink = ((now / 120) & 1) == 0;
-		uint32_t color = blink ? strip.Color(255,0,0) : strip.Color(80,0,0);
+		uint32_t color = blink ? strip.Color(255, 0, 0) : strip.Color(120, 0, 0);
 		for (int i = 0; i < LED_STRIP_COUNT; ++i) strip.setPixelColor(i, color);
 		strip.show();
 #else
 		bool blink = ((now / 120) & 1) == 0;
-		fill_solid(leds, LED_STRIP_COUNT, blink ? CRGB::Red : CRGB::DarkRed);
+		fill_solid(leds, LED_STRIP_COUNT, blink ? CRGB::Red : CRGB(120, 0, 0));
 		FastLED.show();
 #endif
 	}
